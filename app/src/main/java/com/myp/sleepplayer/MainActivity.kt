@@ -2,6 +2,7 @@ package com.myp.sleepplayer
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -12,14 +13,18 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
+import android.util.TypedValue
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.SeekBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import android.view.ScaleGestureDetector
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
@@ -32,6 +37,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.google.common.util.concurrent.ListenableFuture
 import java.util.Locale
@@ -94,6 +100,7 @@ class MainActivity : Activity() {
     private var resizeButton: Button? = null
     private var speedButton: Button? = null
     private var gainButton: Button? = null
+    private var subtitleButton: Button? = null
     private var volumeLabel: TextView? = null
     private var loadedEntries: List<MediaEntry> = emptyList()
     private var currentResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -102,6 +109,11 @@ class MainActivity : Activity() {
     private var isMuted = false
     private var playbackSpeed = 1f
     private var gainDb = 0
+    private var subtitleOverlayEnabled = false
+    private var subtitleSizeSp = 20f
+    private var subtitleColor = Color.WHITE
+    private var subtitleBackgroundAlpha = 150
+    private var subtitleBottomDp = 42
 
     private val controlPrefs by lazy { getSharedPreferences("playback_controls", MODE_PRIVATE) }
     private val audioManager by lazy { getSystemService(AudioManager::class.java) }
@@ -124,6 +136,12 @@ class MainActivity : Activity() {
         isMuted = controlPrefs.getBoolean("muted", false)
         playbackSpeed = controlPrefs.getFloat("speed", 1f).coerceIn(0.5f, 2f)
         gainDb = controlPrefs.getInt("gain_db", 0).coerceIn(0, 12)
+        val subtitlePrefs = getSharedPreferences("subtitle_preferences", MODE_PRIVATE)
+        subtitleOverlayEnabled = subtitlePrefs.getBoolean("overlay_enabled", false)
+        subtitleSizeSp = subtitlePrefs.getFloat("subtitle_size", 20f).coerceIn(12f, 36f)
+        subtitleColor = subtitlePrefs.getInt("subtitle_color", Color.WHITE)
+        subtitleBackgroundAlpha = subtitlePrefs.getInt("subtitle_background_alpha", 150).coerceIn(0, 255)
+        subtitleBottomDp = subtitlePrefs.getInt("subtitle_bottom", 42).coerceIn(8, 180)
         currentResizeMode = controlPrefs.getInt(
             "resize_mode",
             AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -155,6 +173,10 @@ class MainActivity : Activity() {
         }
         header.addView(title)
         header.addView(actionButton("选择目录") { openTreePicker() })
+        subtitleButton = actionButton(if (subtitleOverlayEnabled) "字幕 ✓" else "字幕") {
+            showSubtitleSettings()
+        }
+        header.addView(subtitleButton)
         header.addView(actionButton("定时") { showTimerMenu(it) })
         root.addView(header)
 
@@ -178,6 +200,7 @@ class MainActivity : Activity() {
                 dp(235)
             )
         }
+        applyPlayerSubtitleStyle()
         val scaleDetector = ScaleGestureDetector(this,
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
@@ -486,6 +509,182 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun showSubtitleSettings() {
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(4), dp(20), 0)
+        }
+        val preview = TextView(this).apply {
+            text = "字幕预览\n愿你今晚睡得安稳"
+            gravity = Gravity.CENTER
+            minHeight = dp(88)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        panel.addView(preview, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(10) })
+
+        val overlayCheck = CheckBox(this).apply {
+            text = "退到后台时显示悬浮字幕"
+            isChecked = subtitleOverlayEnabled
+        }
+        panel.addView(overlayCheck)
+        panel.addView(Button(this).apply {
+            text = "授权悬浮字幕显示"
+            isAllCaps = false
+            setOnClickListener { requestOverlayPermission() }
+        })
+
+        val sizeLabel = TextView(this)
+        val sizeSeek = SeekBar(this).apply {
+            max = 24
+            progress = (subtitleSizeSp - 12f).roundToInt()
+        }
+        val alphaLabel = TextView(this)
+        val alphaSeek = SeekBar(this).apply {
+            max = 255
+            progress = subtitleBackgroundAlpha
+        }
+        val bottomLabel = TextView(this)
+        val bottomSeek = SeekBar(this).apply {
+            max = 172
+            progress = subtitleBottomDp - 8
+        }
+        val colorButton = Button(this).apply {
+            isAllCaps = false
+        }
+        fun updatePreview() {
+            val size = (12 + sizeSeek.progress).toFloat()
+            val alpha = alphaSeek.progress
+            val bottom = 8 + bottomSeek.progress
+            sizeLabel.text = "字号：${size.toInt()}sp"
+            alphaLabel.text = "背景透明度：${(alpha * 100 / 255)}%"
+            bottomLabel.text = "距屏幕底部：${bottom}dp"
+            colorButton.text = "字幕颜色：${subtitleColorName(subtitleColor)}"
+            preview.textSize = size
+            preview.setTextColor(subtitleColor)
+            preview.setBackgroundColor(Color.argb(alpha, 0, 0, 0))
+        }
+        colorButton.setOnClickListener { anchor ->
+            PopupMenu(this, anchor).apply {
+                listOf(
+                    "白色" to Color.WHITE,
+                    "暖黄色" to Color.rgb(255, 232, 170),
+                    "青色" to Color.rgb(175, 235, 255),
+                    "浅绿色" to Color.rgb(205, 255, 205)
+                ).forEach { (label, color) ->
+                    menu.add(label).setOnMenuItemClickListener {
+                        subtitleColor = color
+                        updatePreview()
+                        true
+                    }
+                }
+                show()
+            }
+        }
+        sizeSeek.setOnSeekBarChangeListener(previewSeekListener { updatePreview() })
+        alphaSeek.setOnSeekBarChangeListener(previewSeekListener { updatePreview() })
+        bottomSeek.setOnSeekBarChangeListener(previewSeekListener { updatePreview() })
+        panel.addView(sizeLabel)
+        panel.addView(sizeSeek)
+        panel.addView(alphaLabel)
+        panel.addView(alphaSeek)
+        panel.addView(bottomLabel)
+        panel.addView(bottomSeek)
+        panel.addView(colorButton)
+        updatePreview()
+
+        AlertDialog.Builder(this)
+            .setTitle("字幕设置")
+            .setView(panel)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存") { _, _ ->
+                val canOverlay = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+                subtitleOverlayEnabled = overlayCheck.isChecked && canOverlay
+                if (overlayCheck.isChecked && !canOverlay) {
+                    Toast.makeText(this, "请先授权悬浮窗权限，后台字幕才会显示", Toast.LENGTH_LONG).show()
+                }
+                subtitleSizeSp = (12 + sizeSeek.progress).toFloat()
+                subtitleBackgroundAlpha = alphaSeek.progress
+                subtitleBottomDp = 8 + bottomSeek.progress
+                getSharedPreferences("subtitle_preferences", MODE_PRIVATE).edit()
+                    .putBoolean("overlay_enabled", subtitleOverlayEnabled)
+                    .putFloat("subtitle_size", subtitleSizeSp)
+                    .putInt("subtitle_color", subtitleColor)
+                    .putInt("subtitle_background_alpha", subtitleBackgroundAlpha)
+                    .putInt("subtitle_bottom", subtitleBottomDp)
+                    .apply()
+                applyPlayerSubtitleStyle()
+                sendSubtitleSettings()
+            }
+            .show()
+    }
+
+    private fun previewSeekListener(onChanged: () -> Unit): SeekBar.OnSeekBarChangeListener =
+        object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) = onChanged()
+            override fun onStartTrackingTouch(seekBar: SeekBar?) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar?) = Unit
+        }
+
+    private fun subtitleColorName(color: Int): String = when (color) {
+        Color.WHITE -> "白色"
+        Color.rgb(255, 232, 170) -> "暖黄色"
+        Color.rgb(175, 235, 255) -> "青色"
+        Color.rgb(205, 255, 205) -> "浅绿色"
+        else -> "自定义"
+    }
+
+    private fun requestOverlayPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        } else {
+            Toast.makeText(this, "悬浮字幕权限已可用", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun sendSubtitleSettings() {
+        startService(Intent(this, PlaybackService::class.java).apply {
+            action = PlaybackService.ACTION_SET_OVERLAY
+            putExtra(PlaybackService.EXTRA_OVERLAY_ENABLED, subtitleOverlayEnabled)
+        })
+        startService(Intent(this, PlaybackService::class.java).apply {
+            action = PlaybackService.ACTION_SET_SUBTITLE_STYLE
+            putExtra(PlaybackService.EXTRA_SUBTITLE_SIZE, subtitleSizeSp)
+            putExtra(PlaybackService.EXTRA_SUBTITLE_COLOR, subtitleColor)
+            putExtra(PlaybackService.EXTRA_SUBTITLE_BACKGROUND_ALPHA, subtitleBackgroundAlpha)
+            putExtra(PlaybackService.EXTRA_SUBTITLE_BOTTOM, subtitleBottomDp)
+        })
+        subtitleButton?.text = if (subtitleOverlayEnabled) "字幕 ✓" else "字幕"
+    }
+
+    private fun applyPlayerSubtitleStyle() {
+        playerView?.subtitleView?.apply {
+            setApplyEmbeddedStyles(false)
+            setApplyEmbeddedFontSizes(false)
+            setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, subtitleSizeSp)
+            setStyle(
+                CaptionStyleCompat(
+                    subtitleColor,
+                    Color.argb(subtitleBackgroundAlpha, 0, 0, 0),
+                    Color.TRANSPARENT,
+                    CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+                    Color.BLACK,
+                    null
+                )
+            )
+            setBottomPaddingFraction((subtitleBottomDp / 300f).coerceIn(0.02f, 0.45f))
+        }
+    }
+
+    private fun setAppVisible(visible: Boolean) {
+        startService(Intent(this, PlaybackService::class.java).apply {
+            action = PlaybackService.ACTION_SET_APP_VISIBLE
+            putExtra(PlaybackService.EXTRA_APP_VISIBLE, visible)
+        })
+    }
+
     private fun showSystemVolumeMenu(anchor: android.view.View) {
         val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
         val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
@@ -618,8 +817,14 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    override fun onStart() {
+        super.onStart()
+        setAppVisible(true)
+    }
+
     override fun onStop() {
         savePlaybackPosition()
+        setAppVisible(false)
         super.onStop()
     }
 
