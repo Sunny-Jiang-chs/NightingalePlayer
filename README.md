@@ -40,3 +40,12 @@ $env:GRADLE_USER_HOME = "D:\tools\gradle-user-home"
 ```
 
 APK 输出在 `app\build\outputs\apk\debug\app-debug.apk`。
+
+构建发布包：
+
+```powershell
+$env:GRADLE_USER_HOME = "D:\tools\gradle-user-home"
+.\gradlew.bat assembleRelease
+```
+
+未配置签名密钥时，发布 APK 输出在 `app\build\outputs\apk\release\app-release-unsigned.apk`。

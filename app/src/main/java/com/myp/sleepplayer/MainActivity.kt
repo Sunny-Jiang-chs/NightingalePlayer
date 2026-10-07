@@ -14,6 +14,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -23,6 +24,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.text.InputType
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -243,6 +245,8 @@ class MainActivity : Activity() {
     private var playbackSpeed = 1f
     private var gainDb = 0
     private var subtitleOverlayEnabled = false
+    private var videoPreviewCollapsed = false
+    private var audioSectionCollapsed = false
     private var subtitleSizeSp = 20f
     private var subtitleColor = Color.WHITE
     private var subtitleBackgroundAlpha = 150
@@ -320,8 +324,15 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         header.addView(title)
-        header.addView(actionButton("选择目录") { showDirectorySourceMenu(it) })
-        subtitleButton = actionButton(if (subtitleOverlayEnabled) "字幕 ✓" else "字幕") {
+        header.addView(actionButton("目录", R.drawable.ic_folder_open, "选择媒体目录") {
+            showDirectorySourceMenu(it)
+        })
+        subtitleButton = actionButton(
+            "字幕",
+            R.drawable.ic_subtitles,
+            "字幕设置",
+            selected = subtitleOverlayEnabled
+        ) {
             showSubtitleSettings()
         }
         header.addView(subtitleButton)
@@ -719,27 +730,113 @@ class MainActivity : Activity() {
         val videoEntries = loadedEntries.withIndex().filter { it.value.isVideo }
         val audioEntries = loadedEntries.withIndex().filter { !it.value.isVideo }
         if (videoEntries.isNotEmpty()) {
-            addLibrarySectionHeader(container, "MP4 视频预览（${videoEntries.size}）")
-            videoEntries.forEach { indexed ->
-                addLibraryEntry(container, indexed.index, indexed.value)
+            val videoSection = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
             }
+            val videoBody = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                visibility = if (videoPreviewCollapsed) View.GONE else View.VISIBLE
+            }
+            addLibrarySectionHeader(
+                container = videoSection,
+                title = "MP4 视频预览（${videoEntries.size}）",
+                expanded = !videoPreviewCollapsed
+            ) {
+                videoPreviewCollapsed = !videoPreviewCollapsed
+                videoBody.visibility = if (videoPreviewCollapsed) View.GONE else View.VISIBLE
+            }
+            videoEntries.forEach { indexed ->
+                addLibraryEntry(videoBody, indexed.index, indexed.value)
+            }
+            videoSection.addView(videoBody)
+            container.addView(videoSection)
         }
         if (audioEntries.isNotEmpty()) {
-            addLibrarySectionHeader(container, "音频播放（${audioEntries.size}）")
-            audioEntries.forEach { indexed ->
-                addLibraryEntry(container, indexed.index, indexed.value)
+            val audioSection = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                )
             }
+            val audioBody = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                visibility = if (audioSectionCollapsed) View.GONE else View.VISIBLE
+            }
+            addLibrarySectionHeader(
+                container = audioSection,
+                title = "音频播放（${audioEntries.size}）",
+                collapsibleLabel = "音频播放",
+                expanded = !audioSectionCollapsed
+            ) {
+                audioSectionCollapsed = !audioSectionCollapsed
+                audioBody.visibility = if (audioSectionCollapsed) View.GONE else View.VISIBLE
+            }
+            audioEntries.forEach { indexed ->
+                addLibraryEntry(audioBody, indexed.index, indexed.value)
+            }
+            audioSection.addView(audioBody)
+            container.addView(audioSection)
         }
     }
 
-    private fun addLibrarySectionHeader(container: LinearLayout, title: String) {
-        container.addView(TextView(this).apply {
+    private fun addLibrarySectionHeader(
+        container: LinearLayout,
+        title: String,
+        collapsibleLabel: String = "视频预览",
+        expanded: Boolean? = null,
+        onToggle: (() -> Unit)? = null
+    ) {
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        header.addView(TextView(this).apply {
             text = title
             textSize = 15f
             setTextColor(Color.WHITE)
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setPadding(0, dp(12), 0, dp(6))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
+        if (expanded != null && onToggle != null) {
+            var isExpanded = expanded == true
+            header.addView(ImageButton(this).apply {
+                setImageResource(
+                    if (isExpanded) R.drawable.ic_expand_less else R.drawable.ic_expand_more
+                )
+                contentDescription = if (isExpanded) "收起$collapsibleLabel" else "展开$collapsibleLabel"
+                setPadding(0, 0, 0, 0)
+                scaleType = ImageView.ScaleType.CENTER
+                val selectableBackground = TypedValue()
+                theme.resolveAttribute(
+                    android.R.attr.selectableItemBackgroundBorderless,
+                    selectableBackground,
+                    true
+                )
+                setBackgroundResource(selectableBackground.resourceId)
+                layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply {
+                    bottomMargin = dp(2)
+                }
+                setOnClickListener {
+                    onToggle()
+                    isExpanded = !isExpanded
+                    setImageResource(
+                        if (isExpanded) R.drawable.ic_expand_less else R.drawable.ic_expand_more
+                    )
+                    contentDescription = if (isExpanded) "收起$collapsibleLabel" else "展开$collapsibleLabel"
+                }
+            })
+        }
+        container.addView(header)
     }
 
     private fun addLibraryEntry(
@@ -747,14 +844,20 @@ class MainActivity : Activity() {
         index: Int,
         entry: MediaEntry
     ) {
-        val subtitleHint = if (entry.subtitles.isEmpty()) "" else "  ·  VTT ${entry.subtitles.size}"
+        val rowHeight = if (entry.isVideo) dp(64) else dp(52)
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(4) }
+                rowHeight
+            ).apply { bottomMargin = dp(2) }
+            setPadding(0, 0, dp(10), 0)
+            background = mediaRowBackground()
+            isClickable = true
+            isFocusable = true
+            contentDescription = "${entry.name}，播放"
+            setOnClickListener { playEntry(index) }
         }
         if (entry.isVideo) {
             val thumbnail = ImageView(this).apply {
@@ -762,22 +865,53 @@ class MainActivity : Activity() {
                 setImageResource(android.R.drawable.ic_media_play)
                 scaleType = ImageView.ScaleType.CENTER_INSIDE
                 contentDescription = "${entry.name} 封面"
-                layoutParams = LinearLayout.LayoutParams(dp(104), dp(59)).apply {
-                    marginEnd = dp(8)
-                }
+                layoutParams = LinearLayout.LayoutParams(dp(112), ViewGroup.LayoutParams.MATCH_PARENT)
             }
             row.addView(thumbnail)
             loadVideoThumbnail(entry, thumbnail)
         }
-        row.addView(Button(this).apply {
-            text = "${entry.name}$subtitleHint"
+        row.addView(TextView(this).apply {
+            text = entry.name
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            isAllCaps = false
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { playEntry(index) }
+            textSize = 14f
+            setTextColor(Color.rgb(232, 237, 243))
+            setSingleLine(true)
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(12), 0, dp(4), 0)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
         })
+        if (entry.subtitles.isNotEmpty()) {
+            row.addView(TextView(this).apply {
+                text = if (entry.subtitles.size == 1) "字幕" else "字幕 ${entry.subtitles.size}"
+                gravity = Gravity.CENTER
+                textSize = 10.5f
+                includeFontPadding = false
+                setTextColor(Color.rgb(159, 231, 215))
+                setPadding(dp(7), 0, dp(7), 0)
+                background = GradientDrawable().apply {
+                    setColor(Color.rgb(24, 59, 57))
+                    setStroke(dp(1), Color.rgb(54, 126, 113))
+                    cornerRadius = dp(5).toFloat()
+                }
+                contentDescription = "${entry.subtitles.size} 条字幕"
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    dp(26)
+                ).apply {
+                    marginStart = dp(4)
+                    marginEnd = dp(2)
+                }
+            })
+        }
         container.addView(row)
     }
+
+    private fun mediaRowBackground(): StateListDrawable = statefulBackground(
+        normalColor = Color.rgb(27, 33, 40),
+        pressedColor = Color.rgb(43, 53, 63),
+        strokeColor = Color.rgb(48, 58, 69),
+        radius = dp(6)
+    )
 
     private fun loadVideoThumbnail(entry: MediaEntry, target: ImageView) {
         val uriKey = entry.uri.toString()
@@ -1104,7 +1238,7 @@ class MainActivity : Activity() {
             putExtra(PlaybackService.EXTRA_SUBTITLE_BACKGROUND_ALPHA, subtitleBackgroundAlpha)
             putExtra(PlaybackService.EXTRA_SUBTITLE_BOTTOM, subtitleBottomDp)
         })
-        subtitleButton?.text = if (subtitleOverlayEnabled) "字幕 ✓" else "字幕"
+        updateSubtitleButtonStyle()
     }
 
     private fun applyPlayerSubtitleStyle() {
@@ -1430,15 +1564,65 @@ class MainActivity : Activity() {
             .apply()
     }
 
-    private fun actionButton(label: String, action: (android.view.View) -> Unit): Button =
+    private fun statefulBackground(
+        normalColor: Int,
+        pressedColor: Int,
+        strokeColor: Int,
+        radius: Int
+    ): StateListDrawable {
+        fun shape(color: Int) = GradientDrawable().apply {
+            setColor(color)
+            setStroke(dp(1), strokeColor)
+            cornerRadius = radius.toFloat()
+        }
+        return StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_pressed), shape(pressedColor))
+            addState(intArrayOf(android.R.attr.state_focused), shape(pressedColor))
+            addState(intArrayOf(), shape(normalColor))
+        }
+    }
+
+    private fun toolbarButtonBackground(selected: Boolean): StateListDrawable =
+        statefulBackground(
+            normalColor = if (selected) Color.rgb(31, 65, 59) else Color.rgb(27, 33, 40),
+            pressedColor = if (selected) Color.rgb(43, 91, 81) else Color.rgb(43, 53, 63),
+            strokeColor = if (selected) Color.rgb(63, 137, 123) else Color.rgb(48, 58, 69),
+            radius = dp(7)
+        )
+
+    private fun updateSubtitleButtonStyle() {
+        subtitleButton?.background = toolbarButtonBackground(subtitleOverlayEnabled)
+    }
+
+    private fun actionButton(
+        label: String,
+        iconRes: Int,
+        description: String,
+        selected: Boolean = false,
+        action: (android.view.View) -> Unit
+    ): Button =
         Button(this).apply {
             text = label
-            textSize = 12f
+            textSize = 13f
+            setTextColor(Color.rgb(224, 231, 238))
             isAllCaps = false
-            setOnClickListener(action)
+            gravity = Gravity.CENTER
+            minHeight = 0
+            minimumHeight = 0
             minWidth = 0
             minimumWidth = 0
-            setPadding(dp(6), 0, dp(6), 0)
+            setPadding(dp(10), 0, dp(10), 0)
+            setCompoundDrawablesRelativeWithIntrinsicBounds(iconRes, 0, 0, 0)
+            compoundDrawablePadding = dp(6)
+            contentDescription = description
+            background = toolbarButtonBackground(selected)
+            stateListAnimator = null
+            elevation = 0f
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp(40)
+            ).apply { marginStart = dp(6) }
+            setOnClickListener(action)
         }
 
     private fun isExtension(name: String?, extension: String): Boolean =
@@ -1471,8 +1655,8 @@ class MainActivity : Activity() {
             MotionEvent.ACTION_DOWN -> {
                 val player = controller
                 scrubGestureEligible = player != null &&
-                    player.currentMediaItem?.localConfiguration?.mimeType == MimeTypes.VIDEO_MP4 &&
-                    player.duration > 0L
+                    player.duration > 0L &&
+                    !isProgressBarTouch(view, event)
                 scrubGestureCaptured = false
                 scrubStartX = event.x
                 scrubStartY = event.y
@@ -1517,6 +1701,20 @@ class MainActivity : Activity() {
             }
         }
         return false
+    }
+
+    private fun isProgressBarTouch(view: View, event: MotionEvent): Boolean {
+        val progressBar = view.findViewById<View>(androidx.media3.ui.R.id.exo_progress)
+            ?: view.findViewById(androidx.media3.ui.R.id.exo_progress_placeholder)
+            ?: return false
+        if (!progressBar.isShown) return false
+
+        val location = IntArray(2)
+        progressBar.getLocationOnScreen(location)
+        return event.rawX >= location[0] &&
+            event.rawX <= location[0] + progressBar.width &&
+            event.rawY >= location[1] &&
+            event.rawY <= location[1] + progressBar.height
     }
 
     private fun finishScrub(commit: Boolean) {
