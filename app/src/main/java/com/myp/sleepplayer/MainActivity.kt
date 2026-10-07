@@ -227,7 +227,6 @@ class MainActivity : Activity() {
     private var controller: MediaController? = null
     private var playerView: PlayerView? = null
     private var rootLayout: LinearLayout? = null
-    private var statusView: TextView? = null
     private var timingView: TextView? = null
     private var libraryContainer: LinearLayout? = null
     private var timerCountdownView: TextView? = null
@@ -269,7 +268,7 @@ class MainActivity : Activity() {
                 val position = formatTime(player.currentPosition)
                 val duration = formatTime(player.duration)
                 if (!isSeeking) {
-                    timingView?.text = "$position / $duration    实际落点随播放器状态更新"
+                    timingView?.text = "$position / $duration"
                 }
             }
             updateTimerUi()
@@ -327,14 +326,6 @@ class MainActivity : Activity() {
         }
         header.addView(subtitleButton)
         root.addView(header)
-
-        statusView = TextView(this).apply {
-            text = "请选择媒体目录"
-            textSize = 13f
-            setTextColor(Color.rgb(171, 181, 196))
-            setPadding(0, dp(6), 0, dp(6))
-        }
-        root.addView(statusView)
 
         playerView = object : PlayerView(this) {
             override fun dispatchTouchEvent(event: MotionEvent): Boolean {
@@ -416,14 +407,6 @@ class MainActivity : Activity() {
         }
         root.addView(timingView)
 
-        val hint = TextView(this).apply {
-            text = "放大画面后左右滑动可调整播放位置；播放器右下角可进入全屏。"
-            textSize = 12f
-            setTextColor(Color.rgb(129, 143, 164))
-            setPadding(0, 0, 0, dp(6))
-        }
-        root.addView(hint)
-
         val libraryScroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -452,14 +435,6 @@ class MainActivity : Activity() {
                 updateSpeakerButton()
                 setGain(gainDb)
                 controller?.addListener(object : Player.Listener {
-                    override fun onPlaybackStateChanged(playbackState: Int) {
-                        updatePlaybackStatus()
-                    }
-
-                    override fun onIsPlayingChanged(isPlaying: Boolean) {
-                        updatePlaybackStatus()
-                    }
-
                     override fun onPlaybackParametersChanged(
                         playbackParameters: androidx.media3.common.PlaybackParameters
                     ) {
@@ -467,13 +442,21 @@ class MainActivity : Activity() {
                     }
 
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                        statusView?.text = "播放失败：${error.errorCodeName}"
+                        Toast.makeText(
+                            this@MainActivity,
+                            "播放失败：${error.errorCodeName}",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
                 })
                 controller?.setPlaybackSpeed(playbackSpeed)
                 if (loadedEntries.isNotEmpty()) applyPlaylist()
             } catch (error: Exception) {
-                statusView?.text = "播放服务连接失败：${error.message ?: "未知错误"}"
+                Toast.makeText(
+                    this@MainActivity,
+                    "播放服务连接失败：${error.message ?: "未知错误"}",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -628,19 +611,17 @@ class MainActivity : Activity() {
         Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
 
     private fun scanDocumentTree(uri: Uri) {
-        statusView?.text = "正在扫描目录..."
         ioExecutor.execute {
             val root = DocumentFile.fromTreeUri(this, uri)
             val entries = root?.let { scanDocumentDirectory(it) }.orEmpty()
-            runOnUiThread { finishScan(entries, "授权目录") }
+            runOnUiThread { finishScan(entries) }
         }
     }
 
     private fun scanFileDirectory(directory: File) {
-        statusView?.text = "正在扫描目录..."
         ioExecutor.execute {
             val entries = scanFileDirectoryEntries(directory)
-            runOnUiThread { finishScan(entries, directory.absolutePath) }
+            runOnUiThread { finishScan(entries) }
         }
     }
 
@@ -692,17 +673,10 @@ class MainActivity : Activity() {
         }.sortedWith(compareBy<SubtitleFile> { !it.isDefaultFor(videoName) }.thenBy { it.name })
     }
 
-    private fun finishScan(entries: List<MediaEntry>, source: String) {
+    private fun finishScan(entries: List<MediaEntry>) {
         loadedEntries = entries.sortedBy { it.name.lowercase(Locale.ROOT) }
         renderLibrary()
         applyPlaylist()
-        val videoCount = loadedEntries.count { it.isVideo }
-        val audioCount = loadedEntries.size - videoCount
-        statusView?.text = if (loadedEntries.isEmpty()) {
-            "$source 中没有找到 MP4、MP3 或 WAV"
-        } else {
-            "已找到 ${loadedEntries.size} 个媒体（MP4 视频 $videoCount，音频 $audioCount）；外挂字幕会按同名文件自动加载"
-        }
     }
 
     private fun applyPlaylist() {
@@ -800,7 +774,7 @@ class MainActivity : Activity() {
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
             isAllCaps = false
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { playEntry(index, entry) }
+            setOnClickListener { playEntry(index) }
         })
         container.addView(row)
     }
@@ -843,10 +817,9 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun playEntry(index: Int, entry: MediaEntry) {
+    private fun playEntry(index: Int) {
         controller?.seekToDefaultPosition(index)
         controller?.play()
-        statusView?.text = "正在播放 ${entry.name}"
     }
 
     private fun showTimerMenu(anchor: android.view.View) {
@@ -1354,22 +1327,6 @@ class MainActivity : Activity() {
             putExtra(PlaybackService.EXTRA_MINUTES, safeMinutes)
         })
         updateTimerUi()
-        statusView?.text = if (safeMinutes == 0) {
-            "已关闭睡眠定时器"
-        } else {
-            "睡眠定时器：${safeMinutes} 分钟后暂停"
-        }
-    }
-
-    private fun updatePlaybackStatus() {
-        val player = controller ?: return
-        val state = when (player.playbackState) {
-            Player.STATE_BUFFERING -> "缓冲中"
-            Player.STATE_READY -> if (player.isPlaying) "播放中" else "已暂停"
-            Player.STATE_ENDED -> "播放结束"
-            else -> "等待播放"
-        }
-        statusView?.text = state
     }
 
     private fun requestNotificationPermission() {
@@ -1545,7 +1502,7 @@ class MainActivity : Activity() {
                 val proportionalOffset = (seekPerViewWidth.toDouble() * deltaX / width).toLong()
                 scrubTargetPosition = (scrubStartPosition + proportionalOffset)
                     .coerceIn(0L, scrubDuration)
-                timingView?.text = "拖动跳转 ${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
+                timingView?.text = "${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
                 updateScrubOverlay()
             }
 
@@ -1566,7 +1523,7 @@ class MainActivity : Activity() {
         val player = controller
         if (commit && player != null && scrubDuration > 0L) {
             player.seekTo(scrubTargetPosition)
-            timingView?.text = "已跳转 ${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
+            timingView?.text = "${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
             showScrubOverlay("已跳转\n${scrubPositionLabel()}", hideAfterMs = 1_200L)
         } else {
             timingView?.text = "${formatTime(player?.currentPosition ?: 0L)} / ${formatTime(player?.duration ?: 0L)}"
