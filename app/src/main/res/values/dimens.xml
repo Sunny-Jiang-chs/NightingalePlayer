@@ -1,0 +1,4 @@
+<resources>
+    <!-- Bring the visible progress line closer to the bottom operation bar. -->
+    <dimen name="exo_styled_progress_margin_bottom">40dp</dimen>
+</resources>

@@ -341,7 +341,7 @@ class MainActivity : Activity() {
         playerView = object : PlayerView(this) {
             override fun dispatchTouchEvent(event: MotionEvent): Boolean {
                 scaleDetector?.onTouchEvent(event)
-                handleVideoTouch(this, event)
+                if (handleVideoTouch(this, event)) return true
                 return super.dispatchTouchEvent(event)
             }
         }.apply {
@@ -394,6 +394,7 @@ class MainActivity : Activity() {
                 }
             })
         root.addView(playerView)
+        playerView?.post { stylePlayerControls() }
 
         speakerButton = ImageButton(this).apply {
             setPadding(dp(12), dp(12), dp(12), dp(12))
@@ -442,6 +443,7 @@ class MainActivity : Activity() {
                 playerView?.player = controller
                 attachSpeakerButtonToPlayerControls()
                 attachSettingsButtonToPlayerControls()
+                stylePlayerControls()
                 controller?.volume = if (isMuted) 0f else lastVolume
                 updateSpeakerButton()
                 setGain(gainDb)
@@ -1351,6 +1353,16 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun stylePlayerControls() {
+        val video = playerView ?: return
+        video.findViewById<View>(androidx.media3.ui.R.id.exo_controls_background)?.apply {
+            background = ColorDrawable(Color.TRANSPARENT)
+        }
+        video.findViewById<View>(androidx.media3.ui.R.id.exo_bottom_bar)?.apply {
+            background = ColorDrawable(Color.argb(112, 13, 15, 18))
+        }
+    }
+
     private fun attachSpeakerButtonToPlayerControls() {
         val settingsButton = playerView?.findViewById<View>(
             androidx.media3.ui.R.id.exo_settings
@@ -1667,7 +1679,10 @@ class MainActivity : Activity() {
 
             MotionEvent.ACTION_POINTER_DOWN -> {
                 scrubGestureEligible = false
-                if (scrubGestureCaptured) finishScrub(commit = false)
+                if (scrubGestureCaptured) {
+                    finishScrub(commit = false)
+                    return true
+                }
             }
 
             MotionEvent.ACTION_MOVE -> {
@@ -1688,16 +1703,21 @@ class MainActivity : Activity() {
                     .coerceIn(0L, scrubDuration)
                 timingView?.text = "${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
                 updateScrubOverlay()
+                return true
             }
 
             MotionEvent.ACTION_UP -> {
-                if (scrubGestureCaptured) finishScrub(commit = true)
+                val wasScrubbing = scrubGestureCaptured
+                if (wasScrubbing) finishScrub(commit = true)
                 scrubGestureEligible = false
+                return wasScrubbing
             }
 
             MotionEvent.ACTION_CANCEL -> {
-                if (scrubGestureCaptured) finishScrub(commit = false)
+                val wasScrubbing = scrubGestureCaptured
+                if (wasScrubbing) finishScrub(commit = false)
                 scrubGestureEligible = false
+                return wasScrubbing
             }
         }
         return false
@@ -1705,9 +1725,10 @@ class MainActivity : Activity() {
 
     private fun isProgressBarTouch(view: View, event: MotionEvent): Boolean {
         val progressBar = view.findViewById<View>(androidx.media3.ui.R.id.exo_progress)
-            ?: view.findViewById(androidx.media3.ui.R.id.exo_progress_placeholder)
+            ?.takeIf { it.isShown }
+            ?: view.findViewById<View>(androidx.media3.ui.R.id.exo_progress_placeholder)
+                ?.takeIf { it.isShown }
             ?: return false
-        if (!progressBar.isShown) return false
 
         val location = IntArray(2)
         progressBar.getLocationOnScreen(location)
