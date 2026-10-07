@@ -11,12 +11,15 @@ android {
         applicationId = "com.myp.sleepplayer"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.2.0"
+        versionCode = 4
+        versionName = "0.2.1"
     }
 
     buildTypes {
         release {
+            // Keep downloadable builds installable alongside the debug builds used by run_debug.bat.
+            // Production distribution should replace this with a dedicated private release key.
+            signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

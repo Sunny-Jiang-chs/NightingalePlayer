@@ -48,4 +48,4 @@ $env:GRADLE_USER_HOME = "D:\tools\gradle-user-home"
 .\gradlew.bat assembleRelease
 ```
 
-未配置签名密钥时，发布 APK 输出在 `app\build\outputs\apk\release\app-release-unsigned.apk`。
+当前发布构建沿用本机 Android debug 签名，APK 输出在 `app\build\outputs\apk\release\app-release.apk`，可直接安装并覆盖 `run_debug.bat` 安装的版本。正式上架时应替换为专用的私有 release keystore。
