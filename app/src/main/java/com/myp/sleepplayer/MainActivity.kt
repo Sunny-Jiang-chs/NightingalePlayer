@@ -6,17 +6,21 @@ import android.app.AlertDialog
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.util.TypedValue
+import android.window.OnBackInvokedDispatcher
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
@@ -27,6 +31,9 @@ import android.widget.TextView
 import android.widget.Toast
 import android.view.ScaleGestureDetector
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -40,6 +47,7 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.google.common.util.concurrent.ListenableFuture
+import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
 import java.util.concurrent.ExecutorService
@@ -80,8 +88,10 @@ class MainActivity : Activity() {
     companion object {
         private const val REQUEST_TREE = 1001
         private const val REQUEST_NOTIFICATIONS = 1002
+        private const val REQUEST_STORAGE = 1003
         private const val PREFS = "library"
         private const val TREE_URI = "tree_uri"
+        private const val DIRECTORY_PATH = "directory_path"
         private const val LAST_MEDIA_URI = "last_media_uri"
         private const val LAST_MEDIA_POSITION = "last_media_position"
         private const val LAST_MEDIA_PLAYING = "last_media_playing"
@@ -92,6 +102,7 @@ class MainActivity : Activity() {
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
     private var playerView: PlayerView? = null
+    private var rootLayout: LinearLayout? = null
     private var statusView: TextView? = null
     private var timingView: TextView? = null
     private var libraryContainer: LinearLayout? = null
@@ -114,6 +125,8 @@ class MainActivity : Activity() {
     private var subtitleColor = Color.WHITE
     private var subtitleBackgroundAlpha = 150
     private var subtitleBottomDp = 42
+    private var isFullscreen = false
+    private var waitingForAllFilesAccess = false
 
     private val controlPrefs by lazy { getSharedPreferences("playback_controls", MODE_PRIVATE) }
     private val audioManager by lazy { getSystemService(AudioManager::class.java) }
@@ -147,6 +160,7 @@ class MainActivity : Activity() {
             AspectRatioFrameLayout.RESIZE_MODE_FIT
         )
         buildUi()
+        registerFullscreenBackHandler()
         connectController()
         requestNotificationPermission()
         loadSavedTree()
@@ -159,6 +173,7 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.rgb(13, 15, 18))
             setPadding(dp(12), dp(10), dp(12), dp(12))
         }
+        rootLayout = root
 
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -172,7 +187,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         header.addView(title)
-        header.addView(actionButton("选择目录") { openTreePicker() })
+        header.addView(actionButton("选择目录") { showDirectorySourceMenu(it) })
         subtitleButton = actionButton(if (subtitleOverlayEnabled) "字幕 ✓" else "字幕") {
             showSubtitleSettings()
         }
@@ -194,6 +209,7 @@ class MainActivity : Activity() {
             setKeepContentOnPlayerReset(true)
             useController = true
             controllerShowTimeoutMs = 5_000
+            setFullscreenButtonClickListener { fullscreen -> setFullscreen(fullscreen) }
             setBackgroundColor(Color.BLACK)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -273,7 +289,7 @@ class MainActivity : Activity() {
         root.addView(timingView)
 
         val hint = TextView(this).apply {
-            text = "精确 seek 已开启；双指可缩放画面，画面菜单可裁剪放大，音量滑杆可单独调节播放器音量。"
+            text = "精确 seek 已开启；播放器右下角可进入全屏，双指仍可缩放画面。"
             textSize = 12f
             setTextColor(Color.rgb(129, 143, 164))
             setPadding(0, 0, 0, dp(6))
@@ -334,17 +350,145 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQUEST_TREE)
     }
 
-    private fun loadSavedTree() {
-        val saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(TREE_URI, null)
-        if (saved == null) return
-        // Older builds used ".movie" as an example path. Require an explicit
-        // directory choice instead of silently reopening that old location.
-        if (saved.lowercase(Locale.ROOT).contains("primary%3a.movie")) {
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(TREE_URI).apply()
+    private fun showDirectorySourceMenu(anchor: View) {
+        PopupMenu(this, anchor).apply {
+            menu.add("浏览全部目录（含隐藏）").setOnMenuItemClickListener {
+                openAllFilesDirectoryPicker()
+                true
+            }
+            menu.add("使用系统目录选择器").setOnMenuItemClickListener {
+                openTreePicker()
+                true
+            }
+            show()
+        }
+    }
+
+    private fun openAllFilesDirectoryPicker() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            waitingForAllFilesAccess = true
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } catch (_: Exception) {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
             return
         }
-        runOnUiThread { scanDocumentTree(Uri.parse(saved)) }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), REQUEST_STORAGE)
+            return
+        }
+        showFileDirectoryPicker(Environment.getExternalStorageDirectory())
     }
+
+    private fun showFileDirectoryPicker(initialDirectory: File) {
+        var currentDirectory = initialDirectory
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(4), dp(16), 0)
+        }
+        val pathView = TextView(this).apply {
+            setTextColor(Color.DKGRAY)
+            textSize = 13f
+            setPadding(0, 0, 0, dp(6))
+        }
+        val upButton = Button(this).apply {
+            text = "↑ 上一级"
+            isAllCaps = false
+        }
+        val directoryContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        val scroll = ScrollView(this).apply {
+            addView(directoryContainer)
+        }
+        panel.addView(pathView)
+        panel.addView(upButton)
+        panel.addView(
+            scroll,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(420))
+        )
+
+        fun renderDirectory() {
+            pathView.text = currentDirectory.absolutePath
+            val storageRoot = Environment.getExternalStorageDirectory().canonicalFile
+            upButton.isEnabled = currentDirectory.canonicalFile != storageRoot
+            directoryContainer.removeAllViews()
+            val directories = try {
+                currentDirectory.listFiles()
+                    ?.filter { it.isDirectory && it.canRead() }
+                    ?.sortedWith(compareBy<File> { !it.name.startsWith('.') }
+                        .thenBy { it.name.lowercase(Locale.ROOT) })
+                    .orEmpty()
+            } catch (_: SecurityException) {
+                emptyList()
+            }
+            if (directories.isEmpty()) {
+                directoryContainer.addView(TextView(this).apply {
+                    text = "此目录中没有可访问的子目录"
+                    setPadding(0, dp(16), 0, dp(16))
+                })
+            } else {
+                directories.forEach { directory ->
+                    directoryContainer.addView(Button(this).apply {
+                        text = if (directory.name.startsWith('.')) {
+                            "● ${directory.name}  （隐藏）"
+                        } else {
+                            "▸ ${directory.name}"
+                        }
+                        gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                        isAllCaps = false
+                        setOnClickListener {
+                            currentDirectory = directory
+                            renderDirectory()
+                        }
+                    })
+                }
+            }
+        }
+        upButton.setOnClickListener {
+            val storageRoot = Environment.getExternalStorageDirectory().canonicalFile
+            val parent = currentDirectory.parentFile?.canonicalFile
+            if (parent != null && parent.absolutePath.startsWith(storageRoot.absolutePath)) {
+                currentDirectory = parent
+                renderDirectory()
+            }
+        }
+        renderDirectory()
+        AlertDialog.Builder(this)
+            .setTitle("选择媒体目录")
+            .setView(panel)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("使用当前目录") { _, _ ->
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putString(DIRECTORY_PATH, currentDirectory.absolutePath)
+                    .remove(TREE_URI)
+                    .apply()
+                scanFileDirectory(currentDirectory)
+            }
+            .show()
+    }
+
+    private fun loadSavedTree() {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val savedPath = prefs.getString(DIRECTORY_PATH, null)
+        if (savedPath != null && hasAllFilesAccess()) {
+            scanFileDirectory(File(savedPath))
+            return
+        }
+        prefs.getString(TREE_URI, null)?.let { scanDocumentTree(Uri.parse(it)) }
+    }
+
+    private fun hasAllFilesAccess(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
 
     private fun scanDocumentTree(uri: Uri) {
         statusView?.text = "正在扫描目录..."
@@ -353,6 +497,38 @@ class MainActivity : Activity() {
             val entries = root?.let { scanDocumentDirectory(it) }.orEmpty()
             runOnUiThread { finishScan(entries, "授权目录") }
         }
+    }
+
+    private fun scanFileDirectory(directory: File) {
+        statusView?.text = "正在扫描目录..."
+        ioExecutor.execute {
+            val entries = scanFileDirectoryEntries(directory)
+            runOnUiThread { finishScan(entries, directory.absolutePath) }
+        }
+    }
+
+    private fun scanFileDirectoryEntries(directory: File): List<MediaEntry> {
+        val children = try {
+            directory.listFiles()?.sortedBy { it.name.lowercase(Locale.ROOT) }.orEmpty()
+        } catch (_: SecurityException) {
+            emptyList()
+        }
+        val subtitles = children
+            .filter { it.isFile && isExtension(it.name, "vtt") }
+            .map { SubtitleFile(it.name, Uri.fromFile(it)) }
+        val entries = children
+            .filter { it.isFile && isSupportedMedia(it.name) }
+            .map { media ->
+                MediaEntry(
+                    media.name,
+                    Uri.fromFile(media),
+                    mediaMimeType(media.name),
+                    matchSubtitles(media.name, subtitles)
+                )
+            }
+        return entries + children
+            .filter { it.isDirectory && it.canRead() }
+            .flatMap { scanFileDirectoryEntries(it) }
     }
 
     private fun scanDocumentDirectory(directory: DocumentFile): List<MediaEntry> {
@@ -740,6 +916,56 @@ class MainActivity : Activity() {
         playerView?.scaleY = 1f
     }
 
+    private fun setFullscreen(fullscreen: Boolean) {
+        if (isFullscreen == fullscreen) return
+        isFullscreen = fullscreen
+        val root = rootLayout ?: return
+        val video = playerView ?: return
+        if (fullscreen) {
+            for (index in 0 until root.childCount) {
+                val child = root.getChildAt(index)
+                if (child !== video) child.visibility = View.GONE
+            }
+            root.setPadding(0, 0, 0, 0)
+            video.layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            WindowInsetsControllerCompat(window, window.decorView).apply {
+                hide(WindowInsetsCompat.Type.systemBars())
+                systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            for (index in 0 until root.childCount) {
+                root.getChildAt(index).visibility = View.VISIBLE
+            }
+            root.setPadding(dp(12), dp(10), dp(12), dp(12))
+            video.layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(235)
+            )
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            WindowCompat.setDecorFitsSystemWindows(window, true)
+            WindowInsetsControllerCompat(window, window.decorView)
+                .show(WindowInsetsCompat.Type.systemBars())
+        }
+        video.requestLayout()
+    }
+
+    private fun registerFullscreenBackHandler() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT
+            ) {
+                if (isFullscreen) setFullscreen(false) else finishAfterTransition()
+            }
+        }
+    }
+
     private fun toggleMute() {
         if (isMuted || (controller?.volume ?: 0f) <= 0f) {
             isMuted = false
@@ -804,8 +1030,58 @@ class MainActivity : Activity() {
             uri,
             Intent.FLAG_GRANT_READ_URI_PERMISSION
         )
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(TREE_URI, uri.toString()).apply()
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(TREE_URI, uri.toString())
+            .remove(DIRECTORY_PATH)
+            .apply()
         scanDocumentTree(uri)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_STORAGE &&
+            grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
+        ) {
+            showFileDirectoryPicker(Environment.getExternalStorageDirectory())
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (waitingForAllFilesAccess) {
+            waitingForAllFilesAccess = false
+            if (hasAllFilesAccess()) {
+                showFileDirectoryPicker(Environment.getExternalStorageDirectory())
+            } else {
+                Toast.makeText(
+                    this,
+                    "需要允许“所有文件访问”，应用内浏览器才能显示隐藏目录",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    @Deprecated("Handled for fullscreen before delegating to Activity")
+    override fun onBackPressed() {
+        if (isFullscreen) {
+            setFullscreen(false)
+        } else {
+            super.onBackPressed()
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && isFullscreen) {
+            WindowInsetsControllerCompat(window, window.decorView).hide(
+                WindowInsetsCompat.Type.systemBars()
+            )
+        }
     }
 
     override fun onDestroy() {
