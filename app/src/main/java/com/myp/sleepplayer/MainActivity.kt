@@ -4,11 +4,17 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ActivityInfo
+import android.graphics.Canvas
+import android.graphics.Bitmap
 import android.graphics.Color
-import android.media.AudioManager
+import android.graphics.Paint
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -16,15 +22,23 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.InputType
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
 import android.util.TypedValue
 import android.window.OnBackInvokedDispatcher
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.PopupWindow
 import android.widget.SeekBar
 import android.widget.ScrollView
 import android.widget.TextView
@@ -49,6 +63,7 @@ import androidx.media3.ui.PlayerView
 import com.google.common.util.concurrent.ListenableFuture
 import java.io.File
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -83,6 +98,112 @@ private fun isDefaultSubtitle(videoName: String, subtitleName: String): Boolean 
     return subtitleStem == videoStem || subtitleStem == "$videoStem.$extension"
 }
 
+private class VerticalVolumeSlider(
+    context: Context,
+    initialProgress: Int,
+    private val onValueChanged: (Int) -> Unit
+) : View(context) {
+    private val density = resources.displayMetrics.density
+    private var progress = initialProgress.coerceIn(0, 100)
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(92, 103, 116)
+        strokeWidth = 3f * density
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val progressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(104, 207, 188)
+        strokeWidth = 3f * density
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+    }
+
+    init {
+        contentDescription = "垂直调整播放器音量"
+        isFocusable = true
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val centerX = width / 2f
+        val top = 10f * density
+        val bottom = (height - 10f * density).coerceAtLeast(top + density)
+        val fraction = progress / 100f
+        val thumbY = bottom - fraction * (bottom - top)
+        canvas.drawLine(centerX, top, centerX, bottom, trackPaint)
+        canvas.drawLine(centerX, thumbY, centerX, bottom, progressPaint)
+        canvas.drawCircle(centerX, thumbY, 7f * density, thumbPaint)
+    }
+
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.className = SeekBar::class.java.name
+        info.rangeInfo = AccessibilityNodeInfo.RangeInfo.obtain(
+            AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_INT,
+            0f,
+            100f,
+            progress.toFloat()
+        )
+        info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS)
+    }
+
+    override fun performAccessibilityAction(action: Int, arguments: Bundle?): Boolean {
+        if (action == AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.id) {
+            val value = arguments
+                ?.getFloat(AccessibilityNodeInfo.ACTION_ARGUMENT_PROGRESS_VALUE)
+                ?.roundToInt()
+                ?.coerceIn(0, 100)
+                ?: return false
+            setValue(value)
+            return true
+        }
+        return super.performAccessibilityAction(action, arguments)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!isEnabled) return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                isPressed = true
+                parent?.requestDisallowInterceptTouchEvent(true)
+                updateFromTouch(event.y)
+            }
+            MotionEvent.ACTION_MOVE -> updateFromTouch(event.y)
+            MotionEvent.ACTION_UP -> {
+                updateFromTouch(event.y)
+                isPressed = false
+                parent?.requestDisallowInterceptTouchEvent(false)
+                performClick()
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                isPressed = false
+                parent?.requestDisallowInterceptTouchEvent(false)
+            }
+        }
+        return true
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
+
+    private fun updateFromTouch(y: Float) {
+        val top = 10f * density
+        val bottom = (height - 10f * density).coerceAtLeast(top + density)
+        val fraction = ((bottom - y) / (bottom - top)).coerceIn(0f, 1f)
+        setValue((fraction * 100).roundToInt())
+    }
+
+    private fun setValue(value: Int) {
+        val safeValue = value.coerceIn(0, 100)
+        if (progress == safeValue) return
+        progress = safeValue
+        invalidate()
+        onValueChanged(safeValue)
+    }
+}
+
 @UnstableApi
 class MainActivity : Activity() {
     companion object {
@@ -95,6 +216,9 @@ class MainActivity : Activity() {
         private const val LAST_MEDIA_URI = "last_media_uri"
         private const val LAST_MEDIA_POSITION = "last_media_position"
         private const val LAST_MEDIA_PLAYING = "last_media_playing"
+        private const val TIMER_PREFS = "sleep_timer"
+        private const val TIMER_DEADLINE = "deadline_ms"
+        private const val MAX_TIMER_MINUTES = 24 * 60
     }
 
     private val ioExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -106,13 +230,12 @@ class MainActivity : Activity() {
     private var statusView: TextView? = null
     private var timingView: TextView? = null
     private var libraryContainer: LinearLayout? = null
-    private var volumeSeekBar: SeekBar? = null
-    private var muteButton: Button? = null
-    private var resizeButton: Button? = null
-    private var speedButton: Button? = null
-    private var gainButton: Button? = null
+    private var timerCountdownView: TextView? = null
+    private var timerDialog: AlertDialog? = null
+    private var speakerButton: ImageButton? = null
+    private var volumePopup: PopupWindow? = null
+    private var scrubOverlayView: TextView? = null
     private var subtitleButton: Button? = null
-    private var volumeLabel: TextView? = null
     private var loadedEntries: List<MediaEntry> = emptyList()
     private var currentResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
     private var videoScale = 1f
@@ -127,9 +250,17 @@ class MainActivity : Activity() {
     private var subtitleBottomDp = 42
     private var isFullscreen = false
     private var waitingForAllFilesAccess = false
+    private var isSeeking = false
+    private var scrubGestureEligible = false
+    private var scrubGestureCaptured = false
+    private var scrubStartX = 0f
+    private var scrubStartY = 0f
+    private var scrubStartPosition = 0L
+    private var scrubTargetPosition = 0L
+    private var scrubDuration = 0L
+    private var scaleDetector: ScaleGestureDetector? = null
 
     private val controlPrefs by lazy { getSharedPreferences("playback_controls", MODE_PRIVATE) }
-    private val audioManager by lazy { getSystemService(AudioManager::class.java) }
 
     private val progressTicker = object : Runnable {
         override fun run() {
@@ -137,8 +268,11 @@ class MainActivity : Activity() {
             if (player != null) {
                 val position = formatTime(player.currentPosition)
                 val duration = formatTime(player.duration)
-                timingView?.text = "$position / $duration    实际落点随播放器状态更新"
+                if (!isSeeking) {
+                    timingView?.text = "$position / $duration    实际落点随播放器状态更新"
+                }
             }
+            updateTimerUi()
             mainHandler.postDelayed(this, 500L)
         }
     }
@@ -192,7 +326,6 @@ class MainActivity : Activity() {
             showSubtitleSettings()
         }
         header.addView(subtitleButton)
-        header.addView(actionButton("定时") { showTimerMenu(it) })
         root.addView(header)
 
         statusView = TextView(this).apply {
@@ -203,7 +336,13 @@ class MainActivity : Activity() {
         }
         root.addView(statusView)
 
-        playerView = PlayerView(this).apply {
+        playerView = object : PlayerView(this) {
+            override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+                scaleDetector?.onTouchEvent(event)
+                handleVideoTouch(this, event)
+                return super.dispatchTouchEvent(event)
+            }
+        }.apply {
             resizeMode = currentResizeMode
             setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
             setKeepContentOnPlayerReset(true)
@@ -216,8 +355,34 @@ class MainActivity : Activity() {
                 dp(235)
             )
         }
+        scrubOverlayView = TextView(this).apply {
+            visibility = View.GONE
+            gravity = Gravity.CENTER
+            textSize = 17f
+            setTextColor(Color.WHITE)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            background = GradientDrawable().apply {
+                setColor(Color.argb(220, 8, 12, 18))
+                cornerRadius = dp(8).toFloat()
+            }
+            elevation = dp(8).toFloat()
+            isClickable = false
+            isFocusable = false
+        }
+        playerView?.addView(
+            scrubOverlayView,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                topMargin = dp(16)
+                marginStart = dp(20)
+                marginEnd = dp(20)
+            }
+        )
         applyPlayerSubtitleStyle()
-        val scaleDetector = ScaleGestureDetector(this,
+        scaleDetector = ScaleGestureDetector(this,
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
                     videoScale = (videoScale * detector.scaleFactor).coerceIn(1f, 3f)
@@ -226,59 +391,22 @@ class MainActivity : Activity() {
                     return true
                 }
             })
-        playerView?.setOnTouchListener { _, event ->
-            scaleDetector.onTouchEvent(event)
-            false
-        }
         root.addView(playerView)
 
-        val playbackControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(3), 0, dp(3))
+        speakerButton = ImageButton(this).apply {
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = "音量，点击调整"
+            val selectableBackground = TypedValue()
+            theme.resolveAttribute(
+                android.R.attr.selectableItemBackgroundBorderless,
+                selectableBackground,
+                true
+            )
+            setBackgroundResource(selectableBackground.resourceId)
+            setOnClickListener { showVolumePopup(this) }
         }
-        resizeButton = actionButton(resizeLabel()) { showResizeMenu(it) }
-        speedButton = actionButton("倍速 ${speedLabel(playbackSpeed)}") { showSpeedMenu(it) }
-        gainButton = actionButton(gainLabel()) { showGainMenu(it) }
-        playbackControls.addView(resizeButton)
-        playbackControls.addView(speedButton)
-        playbackControls.addView(gainButton)
-        volumeLabel = TextView(this).apply {
-            text = "音量"
-            textSize = 12f
-            setTextColor(Color.rgb(171, 181, 196))
-            setPadding(dp(5), 0, dp(2), 0)
-            isClickable = true
-            setOnClickListener { showSystemVolumeMenu(it) }
-        }
-        playbackControls.addView(volumeLabel)
-        volumeSeekBar = SeekBar(this).apply {
-            max = 100
-            progress = if (isMuted) 0 else (lastVolume * 100).roundToInt()
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(bar: SeekBar?, value: Int, fromUser: Boolean) {
-                    if (!fromUser) return
-                    val volume = value / 100f
-                    if (volume > 0f) {
-                        lastVolume = volume
-                        isMuted = false
-                    } else {
-                        isMuted = true
-                    }
-                    controller?.volume = volume
-                    updateMuteButton()
-                    persistControlSettings()
-                }
-
-                override fun onStartTrackingTouch(bar: SeekBar?) = Unit
-                override fun onStopTrackingTouch(bar: SeekBar?) = Unit
-            })
-        }
-        playbackControls.addView(volumeSeekBar)
-        muteButton = actionButton(if (isMuted) "取消静音" else "静音") { toggleMute() }
-        playbackControls.addView(muteButton)
-        root.addView(playbackControls)
+        updateSpeakerButton()
 
         timingView = TextView(this).apply {
             text = "00:00 / --:--"
@@ -289,7 +417,7 @@ class MainActivity : Activity() {
         root.addView(timingView)
 
         val hint = TextView(this).apply {
-            text = "精确 seek 已开启；播放器右下角可进入全屏，双指仍可缩放画面。"
+            text = "放大画面后左右滑动可调整播放位置；播放器右下角可进入全屏。"
             textSize = 12f
             setTextColor(Color.rgb(129, 143, 164))
             setPadding(0, 0, 0, dp(6))
@@ -318,8 +446,10 @@ class MainActivity : Activity() {
             try {
                 controller = controllerFuture?.get()
                 playerView?.player = controller
+                attachSpeakerButtonToPlayerControls()
+                attachSettingsButtonToPlayerControls()
                 controller?.volume = if (isMuted) 0f else lastVolume
-                controller?.setPlaybackSpeed(playbackSpeed)
+                updateSpeakerButton()
                 setGain(gainDb)
                 controller?.addListener(object : Player.Listener {
                     override fun onPlaybackStateChanged(playbackState: Int) {
@@ -330,10 +460,17 @@ class MainActivity : Activity() {
                         updatePlaybackStatus()
                     }
 
+                    override fun onPlaybackParametersChanged(
+                        playbackParameters: androidx.media3.common.PlaybackParameters
+                    ) {
+                        updatePlaybackSpeedUi(playbackParameters.speed)
+                    }
+
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                         statusView?.text = "播放失败：${error.errorCodeName}"
                     }
                 })
+                controller?.setPlaybackSpeed(playbackSpeed)
                 if (loadedEntries.isNotEmpty()) applyPlaylist()
             } catch (error: Exception) {
                 statusView?.text = "播放服务连接失败：${error.message ?: "未知错误"}"
@@ -559,10 +696,12 @@ class MainActivity : Activity() {
         loadedEntries = entries.sortedBy { it.name.lowercase(Locale.ROOT) }
         renderLibrary()
         applyPlaylist()
+        val videoCount = loadedEntries.count { it.isVideo }
+        val audioCount = loadedEntries.size - videoCount
         statusView?.text = if (loadedEntries.isEmpty()) {
             "$source 中没有找到 MP4、MP3 或 WAV"
         } else {
-            "已找到 ${loadedEntries.size} 个媒体；外挂字幕会按同名文件自动加载"
+            "已找到 ${loadedEntries.size} 个媒体（MP4 视频 $videoCount，音频 $audioCount）；外挂字幕会按同名文件自动加载"
         }
     }
 
@@ -603,83 +742,243 @@ class MainActivity : Activity() {
             })
             return
         }
-        loadedEntries.forEachIndexed { index, entry ->
-            val subtitleHint = if (entry.subtitles.isEmpty()) "" else "  ·  VTT ${entry.subtitles.size}"
-            val button = Button(this).apply {
-                text = "${index + 1}. ${entry.name}$subtitleHint"
-                gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                setOnClickListener {
-                    controller?.seekToDefaultPosition(index)
-                    controller?.play()
-                    statusView?.text = "正在播放 ${entry.name}"
-                }
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(4) }
+        val videoEntries = loadedEntries.withIndex().filter { it.value.isVideo }
+        val audioEntries = loadedEntries.withIndex().filter { !it.value.isVideo }
+        if (videoEntries.isNotEmpty()) {
+            addLibrarySectionHeader(container, "MP4 视频预览（${videoEntries.size}）")
+            videoEntries.forEach { indexed ->
+                addLibraryEntry(container, indexed.index, indexed.value)
             }
-            container.addView(button)
         }
+        if (audioEntries.isNotEmpty()) {
+            addLibrarySectionHeader(container, "音频播放（${audioEntries.size}）")
+            audioEntries.forEach { indexed ->
+                addLibraryEntry(container, indexed.index, indexed.value)
+            }
+        }
+    }
+
+    private fun addLibrarySectionHeader(container: LinearLayout, title: String) {
+        container.addView(TextView(this).apply {
+            text = title
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(0, dp(12), 0, dp(6))
+        })
+    }
+
+    private fun addLibraryEntry(
+        container: LinearLayout,
+        index: Int,
+        entry: MediaEntry
+    ) {
+        val subtitleHint = if (entry.subtitles.isEmpty()) "" else "  ·  VTT ${entry.subtitles.size}"
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(4) }
+        }
+        if (entry.isVideo) {
+            val thumbnail = ImageView(this).apply {
+                setBackgroundColor(Color.rgb(32, 36, 42))
+                setImageResource(android.R.drawable.ic_media_play)
+                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                contentDescription = "${entry.name} 封面"
+                layoutParams = LinearLayout.LayoutParams(dp(104), dp(59)).apply {
+                    marginEnd = dp(8)
+                }
+            }
+            row.addView(thumbnail)
+            loadVideoThumbnail(entry, thumbnail)
+        }
+        row.addView(Button(this).apply {
+            text = "${entry.name}$subtitleHint"
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            isAllCaps = false
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { playEntry(index, entry) }
+        })
+        container.addView(row)
+    }
+
+    private fun loadVideoThumbnail(entry: MediaEntry, target: ImageView) {
+        val uriKey = entry.uri.toString()
+        target.tag = uriKey
+        ioExecutor.execute {
+            var thumbnail: Bitmap? = null
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(this, entry.uri)
+                val frame = retriever.getFrameAtTime(
+                    1_000_000L,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                )
+                if (frame != null) {
+                    thumbnail = Bitmap.createScaledBitmap(frame, dp(240), dp(135), true)
+                    if (thumbnail !== frame) frame.recycle()
+                }
+            } catch (_: Exception) {
+                // Keep the media placeholder when the source has no readable frame.
+            } finally {
+                try {
+                    retriever.release()
+                } catch (_: RuntimeException) {
+                    // Ignore release failures from malformed media.
+                }
+            }
+            val result = thumbnail ?: return@execute
+            runOnUiThread {
+                if (!isDestroyed && target.tag == uriKey) {
+                    target.scaleType = ImageView.ScaleType.CENTER_CROP
+                    target.clearColorFilter()
+                    target.setImageBitmap(result)
+                } else {
+                    result.recycle()
+                }
+            }
+        }
+    }
+
+    private fun playEntry(index: Int, entry: MediaEntry) {
+        controller?.seekToDefaultPosition(index)
+        controller?.play()
+        statusView?.text = "正在播放 ${entry.name}"
     }
 
     private fun showTimerMenu(anchor: android.view.View) {
-        PopupMenu(this, anchor).apply {
-            menu.add("关闭定时").setOnMenuItemClickListener { setTimer(0); true }
-            menu.add("15 分钟").setOnMenuItemClickListener { setTimer(15); true }
-            menu.add("30 分钟").setOnMenuItemClickListener { setTimer(30); true }
-            menu.add("60 分钟").setOnMenuItemClickListener { setTimer(60); true }
-            menu.add("90 分钟").setOnMenuItemClickListener { setTimer(90); true }
-            show()
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(4), dp(20), 0)
         }
+        val countdownView = TextView(this).apply {
+            gravity = Gravity.CENTER
+            textSize = 24f
+            setTextColor(Color.WHITE)
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(0, dp(8), 0, dp(12))
+        }
+        panel.addView(countdownView)
+        panel.addView(TextView(this).apply {
+            text = "快速设置"
+            textSize = 13f
+            setTextColor(Color.rgb(171, 181, 196))
+            setPadding(0, 0, 0, dp(4))
+        })
+        listOf(15, 30, 60, 90).forEach { minutes ->
+            panel.addView(Button(this).apply {
+                text = "${minutes} 分钟"
+                isAllCaps = false
+                setOnClickListener { setTimer(minutes) }
+            })
+        }
+        panel.addView(Button(this).apply {
+            text = "关闭定时"
+            isAllCaps = false
+            setOnClickListener { setTimer(0) }
+        })
+        panel.addView(TextView(this).apply {
+            text = "自定义时长（分钟）"
+            textSize = 13f
+            setTextColor(Color.rgb(171, 181, 196))
+            setPadding(0, dp(10), 0, dp(4))
+        })
+        val customInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "例如 45"
+            setSingleLine(true)
+            contentDescription = "自定义定时分钟数"
+        }
+        panel.addView(customInput)
+        panel.addView(Button(this).apply {
+            text = "设置自定义定时"
+            isAllCaps = false
+            setOnClickListener {
+                val minutes = customInput.text.toString().trim().toIntOrNull()
+                if (minutes == null || minutes !in 1..MAX_TIMER_MINUTES) {
+                    customInput.error = "请输入 1 到 ${MAX_TIMER_MINUTES} 分钟"
+                } else {
+                    customInput.error = null
+                    setTimer(minutes)
+                    customInput.text.clear()
+                }
+            }
+        })
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("睡眠定时")
+            .setView(panel)
+            .setNegativeButton("关闭页面", null)
+            .create()
+        timerCountdownView = countdownView
+        timerDialog = dialog
+        dialog.setOnDismissListener {
+            if (timerCountdownView === countdownView) timerCountdownView = null
+            if (timerDialog === dialog) timerDialog = null
+        }
+        dialog.show()
+        updateTimerUi()
     }
 
-    private fun showResizeMenu(anchor: android.view.View) {
-        PopupMenu(this, anchor).apply {
-            menu.add("适配画面").setOnMenuItemClickListener {
-                setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
-                true
-            }
-            menu.add("裁剪放大").setOnMenuItemClickListener {
-                setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
-                true
-            }
-            menu.add("拉伸填充").setOnMenuItemClickListener {
-                setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FILL)
-                true
-            }
-            menu.add("重置双指缩放").setOnMenuItemClickListener {
-                resetVideoScale()
-                true
-            }
-            show()
-        }
+    private fun setPlaybackSpeed(speed: Float) {
+        val safeSpeed = speed.takeIf { it.isFinite() && it > 0f } ?: 1f
+        controller?.setPlaybackSpeed(safeSpeed)
+        updatePlaybackSpeedUi(safeSpeed)
     }
 
-    private fun showSpeedMenu(anchor: android.view.View) {
-        val speeds = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
+    private fun updatePlaybackSpeedUi(speed: Float) {
+        playbackSpeed = speed.takeIf { it.isFinite() && it > 0f } ?: 1f
+        controlPrefs.edit().putFloat("speed", playbackSpeed).apply()
+    }
+
+    private fun showPlayerSettingsMenu(anchor: View) {
         PopupMenu(this, anchor).apply {
-            speeds.forEach { speed ->
-                val label = if (speed == 1f) "正常 1.0x" else "${speed}x"
-                menu.add(label).setOnMenuItemClickListener {
-                    controller?.setPlaybackSpeed(speed)
-                    playbackSpeed = speed
-                    speedButton?.text = "倍速 ${speedLabel(speed)}"
-                    controlPrefs.edit().putFloat("speed", speed).apply()
+            menu.addSubMenu("画面设置").apply {
+                add("适配画面").setOnMenuItemClickListener {
+                    setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
+                    true
+                }
+                add("裁剪放大").setOnMenuItemClickListener {
+                    setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_ZOOM)
+                    true
+                }
+                add("拉伸填充").setOnMenuItemClickListener {
+                    setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FILL)
+                    true
+                }
+                add("重置双指缩放").setOnMenuItemClickListener {
+                    resetVideoScale()
                     true
                 }
             }
-            show()
-        }
-    }
-
-    private fun showGainMenu(anchor: android.view.View) {
-        PopupMenu(this, anchor).apply {
-            listOf(0, 6, 12).forEach { db ->
-                menu.add(if (db == 0) "原声 0 dB" else "+${db} dB 音频增益")
-                    .setOnMenuItemClickListener {
-                        setGain(db)
+            menu.addSubMenu("倍速 ${speedLabel(playbackSpeed)}").apply {
+                listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f).forEach { speed ->
+                    val label = if (speed == 1f) "正常 1.0x" else "${speed}x"
+                    add(label).setOnMenuItemClickListener {
+                        setPlaybackSpeed(speed)
                         true
                     }
+                }
+            }
+            menu.addSubMenu("增益 ${gainLabel().removePrefix("增益 ")}").apply {
+                listOf(0, 6, 12).forEach { db ->
+                    add(if (db == 0) "原声 0 dB" else "+${db} dB 音频增益")
+                        .setOnMenuItemClickListener {
+                            setGain(db)
+                            true
+                        }
+                }
+            }
+            menu.add("睡眠定时").setOnMenuItemClickListener {
+                showTimerMenu(anchor)
+                true
+            }
+            menu.add("字幕设置").setOnMenuItemClickListener {
+                showSubtitleSettings()
+                true
             }
             show()
         }
@@ -861,30 +1160,8 @@ class MainActivity : Activity() {
         })
     }
 
-    private fun showSystemVolumeMenu(anchor: android.view.View) {
-        val current = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        PopupMenu(this, anchor).apply {
-            menu.add("系统媒体音量：$current/$max")
-            menu.add("设为系统最大音量").setOnMenuItemClickListener {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0)
-                true
-            }
-            menu.add("设为系统 75%").setOnMenuItemClickListener {
-                audioManager.setStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    (max * 0.75f).roundToInt().coerceAtLeast(1),
-                    0
-                )
-                true
-            }
-            show()
-        }
-    }
-
     private fun setGain(db: Int) {
         gainDb = db.coerceIn(0, 12)
-        gainButton?.text = gainLabel()
         controlPrefs.edit().putInt("gain_db", gainDb).apply()
         startService(Intent(this, PlaybackService::class.java).apply {
             action = PlaybackService.ACTION_SET_GAIN
@@ -897,14 +1174,7 @@ class MainActivity : Activity() {
     private fun setResizeMode(mode: Int) {
         currentResizeMode = mode
         playerView?.resizeMode = mode
-        resizeButton?.text = resizeLabel()
         controlPrefs.edit().putInt("resize_mode", mode).apply()
-    }
-
-    private fun resizeLabel(): String = when (currentResizeMode) {
-        AspectRatioFrameLayout.RESIZE_MODE_ZOOM -> "画面 裁剪"
-        AspectRatioFrameLayout.RESIZE_MODE_FILL -> "画面 拉伸"
-        else -> "画面 适配"
     }
 
     private fun speedLabel(speed: Float): String =
@@ -922,6 +1192,7 @@ class MainActivity : Activity() {
         val root = rootLayout ?: return
         val video = playerView ?: return
         if (fullscreen) {
+            volumePopup?.dismiss()
             for (index in 0 until root.childCount) {
                 val child = root.getChildAt(index)
                 if (child !== video) child.visibility = View.GONE
@@ -966,24 +1237,98 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun toggleMute() {
-        if (isMuted || (controller?.volume ?: 0f) <= 0f) {
-            isMuted = false
-            if (lastVolume <= 0f) lastVolume = 1f
-            controller?.volume = lastVolume
-            volumeSeekBar?.progress = (lastVolume * 100).roundToInt()
-        } else {
-            lastVolume = controller?.volume ?: lastVolume
-            isMuted = true
-            controller?.volume = 0f
-            volumeSeekBar?.progress = 0
+    private fun updateSpeakerButton() {
+        speakerButton?.apply {
+            setImageResource(if (isMuted) R.drawable.ic_volume_off else R.drawable.ic_volume_up)
+            contentDescription = if (isMuted) "已静音，点击调整音量" else "音量，点击调整"
         }
-        updateMuteButton()
-        persistControlSettings()
     }
 
-    private fun updateMuteButton() {
-        muteButton?.text = if (isMuted) "取消静音" else "静音"
+    private fun attachSpeakerButtonToPlayerControls() {
+        val settingsButton = playerView?.findViewById<View>(
+            androidx.media3.ui.R.id.exo_settings
+        ) ?: return
+        val controls = settingsButton.parent as? ViewGroup ?: return
+        val speaker = speakerButton ?: return
+        if (speaker.parent === controls) return
+
+        (speaker.parent as? ViewGroup)?.removeView(speaker)
+        val index = controls.indexOfChild(settingsButton)
+        if (index < 0) return
+        controls.addView(
+            speaker,
+            index,
+            ViewGroup.LayoutParams(settingsButton.layoutParams)
+        )
+    }
+
+    private fun attachSettingsButtonToPlayerControls() {
+        val settingsButton = playerView?.findViewById<View>(
+            androidx.media3.ui.R.id.exo_settings
+        ) ?: return
+        settingsButton.contentDescription = "播放器设置"
+        settingsButton.setOnClickListener { showPlayerSettingsMenu(settingsButton) }
+    }
+
+    private fun showVolumePopup(anchor: View) {
+        volumePopup?.takeIf { it.isShowing }?.let {
+            it.dismiss()
+            return
+        }
+
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            background = GradientDrawable().apply {
+                setColor(Color.rgb(34, 39, 46))
+                cornerRadius = dp(8).toFloat()
+            }
+        }
+        val volumeLabel = TextView(this).apply {
+            gravity = Gravity.CENTER
+            textSize = 12f
+            setTextColor(Color.WHITE)
+            setPadding(0, 0, 0, dp(4))
+        }
+        panel.addView(volumeLabel)
+
+        val initialProgress = if (isMuted) 0 else
+            ((controller?.volume ?: lastVolume) * 100).roundToInt().coerceIn(0, 100)
+        val verticalSlider = VerticalVolumeSlider(this, initialProgress) { value ->
+            val volume = value / 100f
+            controller?.volume = volume
+            if (volume > 0f) {
+                lastVolume = volume
+                isMuted = false
+            } else {
+                isMuted = true
+            }
+            volumeLabel.text = "音量 ${value}%"
+            updateSpeakerButton()
+            persistControlSettings()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(dp(48), dp(180))
+        }
+        volumeLabel.text = "音量 ${initialProgress}%"
+        panel.addView(verticalSlider)
+
+        val popupWidth = dp(88)
+        val popupHeight = dp(224)
+        val popup = PopupWindow(panel, popupWidth, popupHeight, true).apply {
+            isOutsideTouchable = true
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            elevation = dp(8).toFloat()
+            setOnDismissListener {
+                if (volumePopup === this) volumePopup = null
+            }
+        }
+        volumePopup = popup
+        popup.showAsDropDown(
+            anchor,
+            -((popupWidth - anchor.width) / 2),
+            -popupHeight - anchor.height
+        )
     }
 
     private fun persistControlSettings() {
@@ -996,11 +1341,24 @@ class MainActivity : Activity() {
     }
 
     private fun setTimer(minutes: Int) {
+        val safeMinutes = minutes.coerceIn(0, MAX_TIMER_MINUTES)
+        getSharedPreferences(TIMER_PREFS, MODE_PRIVATE).edit().apply {
+            if (safeMinutes == 0) {
+                remove(TIMER_DEADLINE)
+            } else {
+                putLong(TIMER_DEADLINE, System.currentTimeMillis() + safeMinutes * 60_000L)
+            }
+        }.apply()
         startService(Intent(this, PlaybackService::class.java).apply {
             action = PlaybackService.ACTION_SET_TIMER
-            putExtra(PlaybackService.EXTRA_MINUTES, minutes)
+            putExtra(PlaybackService.EXTRA_MINUTES, safeMinutes)
         })
-        statusView?.text = if (minutes == 0) "已关闭睡眠定时器" else "睡眠定时器：${minutes} 分钟后暂停"
+        updateTimerUi()
+        statusView?.text = if (safeMinutes == 0) {
+            "已关闭睡眠定时器"
+        } else {
+            "睡眠定时器：${safeMinutes} 分钟后暂停"
+        }
     }
 
     private fun updatePlaybackStatus() {
@@ -1087,6 +1445,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         savePlaybackPosition()
         mainHandler.removeCallbacks(progressTicker)
+        volumePopup?.dismiss()
         ioExecutor.shutdownNow()
         controller?.release()
         controllerFuture?.cancel(true)
@@ -1150,6 +1509,130 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun handleVideoTouch(view: View, event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val player = controller
+                scrubGestureEligible = player != null &&
+                    player.currentMediaItem?.localConfiguration?.mimeType == MimeTypes.VIDEO_MP4 &&
+                    player.duration > 0L
+                scrubGestureCaptured = false
+                scrubStartX = event.x
+                scrubStartY = event.y
+                scrubStartPosition = player?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                scrubTargetPosition = scrubStartPosition
+                scrubDuration = player?.duration?.coerceAtLeast(0L) ?: 0L
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                scrubGestureEligible = false
+                if (scrubGestureCaptured) finishScrub(commit = false)
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (!scrubGestureEligible || event.pointerCount != 1) return false
+                val deltaX = event.x - scrubStartX
+                val deltaY = event.y - scrubStartY
+                if (!scrubGestureCaptured) {
+                    val horizontal = abs(deltaX) > dp(12) && abs(deltaX) > abs(deltaY) * 1.2f
+                    if (!horizontal) return false
+                    scrubGestureCaptured = true
+                    isSeeking = true
+                    updateScrubOverlay()
+                }
+                val width = view.width.coerceAtLeast(1).toDouble()
+                val seekPerViewWidth = (scrubDuration / 10L).coerceAtMost(60_000L)
+                val proportionalOffset = (seekPerViewWidth.toDouble() * deltaX / width).toLong()
+                scrubTargetPosition = (scrubStartPosition + proportionalOffset)
+                    .coerceIn(0L, scrubDuration)
+                timingView?.text = "拖动跳转 ${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
+                updateScrubOverlay()
+            }
+
+            MotionEvent.ACTION_UP -> {
+                if (scrubGestureCaptured) finishScrub(commit = true)
+                scrubGestureEligible = false
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                if (scrubGestureCaptured) finishScrub(commit = false)
+                scrubGestureEligible = false
+            }
+        }
+        return false
+    }
+
+    private fun finishScrub(commit: Boolean) {
+        val player = controller
+        if (commit && player != null && scrubDuration > 0L) {
+            player.seekTo(scrubTargetPosition)
+            timingView?.text = "已跳转 ${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
+            showScrubOverlay("已跳转\n${scrubPositionLabel()}", hideAfterMs = 1_200L)
+        } else {
+            timingView?.text = "${formatTime(player?.currentPosition ?: 0L)} / ${formatTime(player?.duration ?: 0L)}"
+            hideScrubOverlay()
+        }
+        isSeeking = false
+        scrubGestureCaptured = false
+    }
+
+    private fun updateScrubOverlay() {
+        val delta = scrubTargetPosition - scrubStartPosition
+        val direction = if (delta >= 0L) "快进" else "回退"
+        val signedDelta = if (delta >= 0L) "+${formatTime(delta)}" else "-${formatTime(-delta)}"
+        showScrubOverlay("$direction $signedDelta\n${scrubPositionLabel()}", hideAfterMs = null)
+    }
+
+    private fun scrubPositionLabel(): String =
+        "目标 ${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
+
+    private fun showScrubOverlay(text: String, hideAfterMs: Long?) {
+        val overlay = scrubOverlayView ?: return
+        mainHandler.removeCallbacks(hideScrubOverlayRunnable)
+        overlay.text = text
+        overlay.visibility = View.VISIBLE
+        overlay.bringToFront()
+        if (hideAfterMs != null) {
+            mainHandler.postDelayed(hideScrubOverlayRunnable, hideAfterMs)
+        }
+    }
+
+    private val hideScrubOverlayRunnable = Runnable {
+        scrubOverlayView?.visibility = View.GONE
+    }
+
+    private fun hideScrubOverlay() {
+        mainHandler.removeCallbacks(hideScrubOverlayRunnable)
+        scrubOverlayView?.visibility = View.GONE
+    }
+
+    private fun timerRemainingMs(): Long {
+        val deadline = getSharedPreferences(TIMER_PREFS, MODE_PRIVATE)
+            .getLong(TIMER_DEADLINE, 0L)
+        return (deadline - System.currentTimeMillis()).coerceAtLeast(0L)
+    }
+
+    private fun formatTimerRemaining(milliseconds: Long): String {
+        val totalSeconds = ((milliseconds + 999L) / 1_000L).coerceAtLeast(0L)
+        val hours = totalSeconds / 3_600L
+        val minutes = (totalSeconds % 3_600L) / 60L
+        val seconds = totalSeconds % 60L
+        return if (hours > 0L) {
+            "%02d:%02d:%02d".format(Locale.ROOT, hours, minutes, seconds)
+        } else {
+            "%02d:%02d".format(Locale.ROOT, minutes, seconds)
+        }
+    }
+
+    private fun updateTimerUi() {
+        val remaining = timerRemainingMs()
+        timerCountdownView?.text = if (remaining > 0L) {
+            "剩余时间\n${formatTimerRemaining(remaining)}"
+        } else {
+            "当前未设置定时"
+        }
+    }
+
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private data class SubtitleFile(val name: String, val uri: Uri) {
@@ -1162,6 +1645,9 @@ class MainActivity : Activity() {
         val mimeType: String,
         val subtitles: List<SubtitleFile>
     ) {
+        val isVideo: Boolean
+            get() = mimeType == MimeTypes.VIDEO_MP4
+
         fun toMediaItem(): MediaItem {
             val subtitleConfigurations = subtitles.map { subtitle ->
                 val suffix = subtitleSuffix(name, subtitle.name)
