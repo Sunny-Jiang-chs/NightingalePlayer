@@ -22,6 +22,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.text.InputType
 import android.text.TextUtils
@@ -41,6 +42,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.PopupWindow
+import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.ScrollView
 import android.widget.TextView
@@ -50,6 +52,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.ViewCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -209,6 +212,7 @@ private class VerticalVolumeSlider(
 @UnstableApi
 class MainActivity : Activity() {
     companion object {
+        private const val LONG_PRESS_SPEED_BOOST_MS = 450L
         private const val REQUEST_TREE = 1001
         private const val REQUEST_NOTIFICATIONS = 1002
         private const val REQUEST_STORAGE = 1003
@@ -253,15 +257,34 @@ class MainActivity : Activity() {
     private var subtitleBottomDp = 42
     private var isFullscreen = false
     private var waitingForAllFilesAccess = false
+    private var scanSequence = 0
     private var isSeeking = false
     private var scrubGestureEligible = false
     private var scrubGestureCaptured = false
+    private var touchGestureEligible = false
+    private var verticalGestureCaptured = false
+    private var verticalGestureSide = 0
+    private var verticalGestureStartValue = 0f
+    private var touchGestureActive = false
+    private var speedBoostActive = false
+    private var speedBeforeBoost = 1f
     private var scrubStartX = 0f
     private var scrubStartY = 0f
     private var scrubStartPosition = 0L
     private var scrubTargetPosition = 0L
     private var scrubDuration = 0L
     private var scaleDetector: ScaleGestureDetector? = null
+
+    private val longPressSpeedBoostRunnable = Runnable {
+        if (touchGestureActive &&
+            touchGestureEligible &&
+            !scrubGestureCaptured &&
+            !verticalGestureCaptured &&
+            controller?.isPlaying == true
+        ) {
+            beginSpeedBoost()
+        }
+    }
 
     private val controlPrefs by lazy { getSharedPreferences("playback_controls", MODE_PRIVATE) }
 
@@ -282,6 +305,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         lastVolume = controlPrefs.getFloat("volume", 1f).coerceIn(0f, 1f)
         isMuted = controlPrefs.getBoolean("muted", false)
         playbackSpeed = controlPrefs.getFloat("speed", 1f).coerceIn(0.5f, 2f)
@@ -311,6 +335,20 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(10), dp(12), dp(12))
         }
         rootLayout = root
+        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            if (isFullscreen) {
+                view.setPadding(0, 0, 0, 0)
+            } else {
+                val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+                view.setPadding(
+                    dp(12),
+                    dp(10) + systemBars.top,
+                    dp(12),
+                    dp(12) + systemBars.bottom
+                )
+            }
+            insets
+        }
 
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -479,6 +517,7 @@ class MainActivity : Activity() {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
             addFlags(Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
+            savedTreeUri()?.let { putExtra(DocumentsContract.EXTRA_INITIAL_URI, it) }
         }
         startActivityForResult(intent, REQUEST_TREE)
     }
@@ -519,7 +558,25 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), REQUEST_STORAGE)
             return
         }
-        showFileDirectoryPicker(Environment.getExternalStorageDirectory())
+        showFileDirectoryPicker(
+            savedFileDirectory() ?: Environment.getExternalStorageDirectory()
+        )
+    }
+
+    private fun savedFileDirectory(): File? =
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(DIRECTORY_PATH, null)
+            ?.let { path -> runCatching { File(path).canonicalFile }.getOrNull() }
+            ?.takeIf { it.isDirectory && it.canRead() }
+
+    private fun savedTreeUri(): Uri? {
+        val savedUri = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(TREE_URI, null)
+            ?.let { value -> runCatching { Uri.parse(value) }.getOrNull() }
+            ?: return null
+        return contentResolver.persistedUriPermissions
+            .firstOrNull { it.uri == savedUri && it.isReadPermission }
+            ?.uri
     }
 
     private fun showFileDirectoryPicker(initialDirectory: File) {
@@ -555,21 +612,40 @@ class MainActivity : Activity() {
             val storageRoot = Environment.getExternalStorageDirectory().canonicalFile
             upButton.isEnabled = currentDirectory.canonicalFile != storageRoot
             directoryContainer.removeAllViews()
-            val directories = try {
+            val children = try {
                 currentDirectory.listFiles()
-                    ?.filter { it.isDirectory && it.canRead() }
-                    ?.sortedWith(compareBy<File> { !it.name.startsWith('.') }
+                    ?.filter { it.canRead() }
+                    ?.sortedWith(compareBy<File> { !it.isDirectory }
+                        .thenBy { it.name.startsWith('.') }
                         .thenBy { it.name.lowercase(Locale.ROOT) })
                     .orEmpty()
             } catch (_: SecurityException) {
                 emptyList()
             }
-            if (directories.isEmpty()) {
+            val directories = children.filter { it.isDirectory }
+            val files = children.filter { it.isFile }
+            val playableCount = files.count { isSupportedMedia(it.name) }
+            val subtitleCount = files.count { isExtension(it.name, "vtt") }
+
+            directoryContainer.addView(TextView(this).apply {
+                text = buildString {
+                    append("${directories.size} 个子目录 · ${files.size} 个文件")
+                    if (playableCount > 0) append(" · ${playableCount} 个可播放")
+                    if (subtitleCount > 0) append(" · ${subtitleCount} 个字幕")
+                }
+                textSize = 12f
+                setTextColor(Color.GRAY)
+                setPadding(0, dp(4), 0, dp(8))
+            })
+
+            if (directories.isNotEmpty()) {
                 directoryContainer.addView(TextView(this).apply {
-                    text = "此目录中没有可访问的子目录"
-                    setPadding(0, dp(16), 0, dp(16))
+                    text = "子目录"
+                    textSize = 13f
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    setTextColor(Color.DKGRAY)
+                    setPadding(0, dp(4), 0, dp(2))
                 })
-            } else {
                 directories.forEach { directory ->
                     directoryContainer.addView(Button(this).apply {
                         text = if (directory.name.startsWith('.')) {
@@ -585,6 +661,50 @@ class MainActivity : Activity() {
                         }
                     })
                 }
+            }
+
+            if (files.isNotEmpty()) {
+                directoryContainer.addView(TextView(this).apply {
+                    text = "当前目录内容"
+                    textSize = 13f
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    setTextColor(Color.DKGRAY)
+                    setPadding(0, dp(10), 0, dp(2))
+                })
+                val previewLimit = 40
+                files.take(previewLimit).forEach { file ->
+                    val label = when {
+                        isExtension(file.name, "mp4") -> "[视频]"
+                        isExtension(file.name, "mp3") || isExtension(file.name, "wav") -> "[音频]"
+                        isExtension(file.name, "vtt") -> "[字幕]"
+                        else -> "[文件]"
+                    }
+                    directoryContainer.addView(TextView(this).apply {
+                        text = "$label ${file.name}"
+                        textSize = 13f
+                        setTextColor(Color.DKGRAY)
+                        maxLines = 1
+                        ellipsize = TextUtils.TruncateAt.MIDDLE
+                        setPadding(dp(8), dp(5), 0, dp(5))
+                    })
+                }
+                if (files.size > previewLimit) {
+                    directoryContainer.addView(TextView(this).apply {
+                        text = "… 还有 ${files.size - previewLimit} 个文件未显示"
+                        textSize = 12f
+                        setTextColor(Color.GRAY)
+                        setPadding(dp(8), dp(4), 0, dp(8))
+                    })
+                }
+            }
+
+            if (children.isEmpty()) {
+                directoryContainer.addView(TextView(this).apply {
+                    text = "此目录为空或没有可访问的内容"
+                    textSize = 13f
+                    setTextColor(Color.GRAY)
+                    setPadding(0, dp(16), 0, dp(16))
+                })
             }
         }
         upButton.setOnClickListener {
@@ -611,31 +731,72 @@ class MainActivity : Activity() {
     }
 
     private fun loadSavedTree() {
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val savedPath = prefs.getString(DIRECTORY_PATH, null)
-        if (savedPath != null && hasAllFilesAccess()) {
-            scanFileDirectory(File(savedPath))
+        val savedDirectory = savedFileDirectory()
+        if (savedDirectory != null && hasAllFilesAccess()) {
+            scanFileDirectory(savedDirectory)
             return
         }
-        prefs.getString(TREE_URI, null)?.let { scanDocumentTree(Uri.parse(it)) }
+        savedTreeUri()?.let { scanDocumentTree(it) }
     }
 
     private fun hasAllFilesAccess(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
 
     private fun scanDocumentTree(uri: Uri) {
+        val requestId = beginScan()
         ioExecutor.execute {
-            val root = DocumentFile.fromTreeUri(this, uri)
-            val entries = root?.let { scanDocumentDirectory(it) }.orEmpty()
-            runOnUiThread { finishScan(entries) }
+            val entries = try {
+                val root = DocumentFile.fromTreeUri(this, uri)
+                root?.let { scanDocumentDirectory(it) }.orEmpty()
+            } catch (_: RuntimeException) {
+                emptyList()
+            }
+            runOnUiThread {
+                if (requestId == scanSequence) finishScan(entries)
+            }
         }
     }
 
     private fun scanFileDirectory(directory: File) {
+        val requestId = beginScan()
         ioExecutor.execute {
-            val entries = scanFileDirectoryEntries(directory)
-            runOnUiThread { finishScan(entries) }
+            val entries = try {
+                scanFileDirectoryEntries(directory)
+            } catch (_: RuntimeException) {
+                emptyList()
+            }
+            runOnUiThread {
+                if (requestId == scanSequence) finishScan(entries)
+            }
         }
+    }
+
+    private fun beginScan(): Int {
+        val requestId = ++scanSequence
+        showLibraryLoading()
+        return requestId
+    }
+
+    private fun showLibraryLoading() {
+        val container = libraryContainer ?: return
+        container.removeAllViews()
+        val loading = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(18), 0, dp(18))
+        }
+        loading.addView(ProgressBar(this).apply {
+            isIndeterminate = true
+            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)).apply {
+                marginEnd = dp(12)
+            }
+        })
+        loading.addView(TextView(this).apply {
+            text = "正在加载媒体目录…"
+            textSize = 14f
+            setTextColor(Color.rgb(171, 181, 196))
+        })
+        container.addView(loading)
     }
 
     private fun scanFileDirectoryEntries(directory: File): List<MediaEntry> {
@@ -865,7 +1026,7 @@ class MainActivity : Activity() {
             val thumbnail = ImageView(this).apply {
                 setBackgroundColor(Color.rgb(32, 36, 42))
                 setImageResource(android.R.drawable.ic_media_play)
-                scaleType = ImageView.ScaleType.CENTER_INSIDE
+                scaleType = ImageView.ScaleType.CENTER_CROP
                 contentDescription = "${entry.name} 封面"
                 layoutParams = LinearLayout.LayoutParams(dp(112), ViewGroup.LayoutParams.MATCH_PARENT)
             }
@@ -928,7 +1089,7 @@ class MainActivity : Activity() {
                     MediaMetadataRetriever.OPTION_CLOSEST_SYNC
                 )
                 if (frame != null) {
-                    thumbnail = Bitmap.createScaledBitmap(frame, dp(240), dp(135), true)
+                    thumbnail = centerCropBitmap(frame, dp(240), dp(135))
                     if (thumbnail !== frame) frame.recycle()
                 }
             } catch (_: Exception) {
@@ -951,6 +1112,26 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+    private fun centerCropBitmap(source: Bitmap, targetWidth: Int, targetHeight: Int): Bitmap {
+        val sourceRatio = source.width.toFloat() / source.height.coerceAtLeast(1)
+        val targetRatio = targetWidth.toFloat() / targetHeight.coerceAtLeast(1)
+        val cropWidth: Int
+        val cropHeight: Int
+        if (sourceRatio > targetRatio) {
+            cropHeight = source.height
+            cropWidth = (source.height * targetRatio).roundToInt().coerceIn(1, source.width)
+        } else {
+            cropWidth = source.width
+            cropHeight = (source.width / targetRatio).roundToInt().coerceIn(1, source.height)
+        }
+        val left = ((source.width - cropWidth) / 2).coerceAtLeast(0)
+        val top = ((source.height - cropHeight) / 2).coerceAtLeast(0)
+        val cropped = Bitmap.createBitmap(source, left, top, cropWidth, cropHeight)
+        val scaled = Bitmap.createScaledBitmap(cropped, targetWidth, targetHeight, true)
+        if (cropped !== scaled && cropped !== source) cropped.recycle()
+        return scaled
     }
 
     private fun playEntry(index: Int) {
@@ -1039,8 +1220,28 @@ class MainActivity : Activity() {
     }
 
     private fun updatePlaybackSpeedUi(speed: Float) {
+        if (speedBoostActive) return
         playbackSpeed = speed.takeIf { it.isFinite() && it > 0f } ?: 1f
         controlPrefs.edit().putFloat("speed", playbackSpeed).apply()
+    }
+
+    private fun beginSpeedBoost() {
+        val player = controller ?: return
+        if (speedBoostActive || !player.isPlaying) return
+        speedBeforeBoost = player.playbackParameters.speed
+            .takeIf { it.isFinite() && it > 0f } ?: playbackSpeed
+        speedBoostActive = true
+        player.setPlaybackSpeed(3f)
+        showScrubOverlay("3.0x 加速", hideAfterMs = null)
+    }
+
+    private fun endSpeedBoost() {
+        if (!speedBoostActive) return
+        speedBoostActive = false
+        val restoredSpeed = speedBeforeBoost.takeIf { it.isFinite() && it > 0f } ?: 1f
+        controller?.setPlaybackSpeed(restoredSpeed)
+        updatePlaybackSpeedUi(restoredSpeed)
+        showScrubOverlay("恢复 ${speedLabel(restoredSpeed)}", hideAfterMs = 700L)
     }
 
     private fun showPlayerSettingsMenu(anchor: View) {
@@ -1329,10 +1530,10 @@ class MainActivity : Activity() {
                 dp(235)
             )
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            WindowCompat.setDecorFitsSystemWindows(window, true)
             WindowInsetsControllerCompat(window, window.decorView)
                 .show(WindowInsetsCompat.Type.systemBars())
         }
+        ViewCompat.requestApplyInsets(root)
         video.requestLayout()
     }
 
@@ -1507,7 +1708,9 @@ class MainActivity : Activity() {
         if (requestCode == REQUEST_STORAGE &&
             grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
         ) {
-            showFileDirectoryPicker(Environment.getExternalStorageDirectory())
+            showFileDirectoryPicker(
+                savedFileDirectory() ?: Environment.getExternalStorageDirectory()
+            )
         }
     }
 
@@ -1516,7 +1719,9 @@ class MainActivity : Activity() {
         if (waitingForAllFilesAccess) {
             waitingForAllFilesAccess = false
             if (hasAllFilesAccess()) {
-                showFileDirectoryPicker(Environment.getExternalStorageDirectory())
+                showFileDirectoryPicker(
+                    savedFileDirectory() ?: Environment.getExternalStorageDirectory()
+                )
             } else {
                 Toast.makeText(
                     this,
@@ -1666,36 +1871,70 @@ class MainActivity : Activity() {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 val player = controller
+                mainHandler.removeCallbacks(longPressSpeedBoostRunnable)
+                touchGestureActive = true
+                verticalGestureCaptured = false
+                verticalGestureSide = 0
+                val blockedTouch = isProgressBarTouch(view, event) ||
+                    isPlayerControlTouch(view, event)
+                touchGestureEligible = !blockedTouch
                 scrubGestureEligible = player != null &&
                     player.duration > 0L &&
-                    !isProgressBarTouch(view, event)
+                    !blockedTouch
                 scrubGestureCaptured = false
                 scrubStartX = event.x
                 scrubStartY = event.y
                 scrubStartPosition = player?.currentPosition?.coerceAtLeast(0L) ?: 0L
                 scrubTargetPosition = scrubStartPosition
                 scrubDuration = player?.duration?.coerceAtLeast(0L) ?: 0L
+                if (touchGestureEligible && player?.isPlaying == true) {
+                    mainHandler.postDelayed(longPressSpeedBoostRunnable, LONG_PRESS_SPEED_BOOST_MS)
+                }
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
+                mainHandler.removeCallbacks(longPressSpeedBoostRunnable)
                 scrubGestureEligible = false
+                touchGestureEligible = false
                 if (scrubGestureCaptured) {
                     finishScrub(commit = false)
+                    return true
+                }
+                if (verticalGestureCaptured) {
+                    finishVerticalGesture()
+                    return true
+                }
+                if (speedBoostActive) {
+                    endSpeedBoost()
                     return true
                 }
             }
 
             MotionEvent.ACTION_MOVE -> {
-                if (!scrubGestureEligible || event.pointerCount != 1) return false
+                if (!touchGestureEligible || event.pointerCount != 1) return false
+                if (speedBoostActive) return true
                 val deltaX = event.x - scrubStartX
                 val deltaY = event.y - scrubStartY
                 if (!scrubGestureCaptured) {
                     val horizontal = abs(deltaX) > dp(12) && abs(deltaX) > abs(deltaY) * 1.2f
-                    if (!horizontal) return false
-                    scrubGestureCaptured = true
-                    isSeeking = true
-                    updateScrubOverlay()
+                    val vertical = abs(deltaY) > dp(12) && abs(deltaY) > abs(deltaX) * 1.2f
+                    if (!horizontal && !vertical) return false
+                    mainHandler.removeCallbacks(longPressSpeedBoostRunnable)
+                    if (horizontal && scrubGestureEligible) {
+                        scrubGestureCaptured = true
+                        isSeeking = true
+                        updateScrubOverlay()
+                    } else if (vertical) {
+                        beginVerticalGesture(view, event)
+                    } else {
+                        return false
+                    }
                 }
+                if (verticalGestureCaptured) {
+                    updateVerticalGesture(view, event)
+                    return true
+                }
+                if (!scrubGestureCaptured) return false
                 val width = view.width.coerceAtLeast(1).toDouble()
                 val seekPerViewWidth = (scrubDuration / 10L).coerceAtMost(60_000L)
                 val proportionalOffset = (seekPerViewWidth.toDouble() * deltaX / width).toLong()
@@ -1707,20 +1946,129 @@ class MainActivity : Activity() {
             }
 
             MotionEvent.ACTION_UP -> {
+                mainHandler.removeCallbacks(longPressSpeedBoostRunnable)
+                touchGestureActive = false
+                if (speedBoostActive) {
+                    endSpeedBoost()
+                    scrubGestureEligible = false
+                    touchGestureEligible = false
+                    return true
+                }
+                if (verticalGestureCaptured) {
+                    finishVerticalGesture()
+                    scrubGestureEligible = false
+                    touchGestureEligible = false
+                    return true
+                }
                 val wasScrubbing = scrubGestureCaptured
                 if (wasScrubbing) finishScrub(commit = true)
                 scrubGestureEligible = false
+                touchGestureEligible = false
                 return wasScrubbing
             }
 
             MotionEvent.ACTION_CANCEL -> {
+                mainHandler.removeCallbacks(longPressSpeedBoostRunnable)
+                touchGestureActive = false
+                if (speedBoostActive) endSpeedBoost()
+                if (verticalGestureCaptured) finishVerticalGesture()
                 val wasScrubbing = scrubGestureCaptured
                 if (wasScrubbing) finishScrub(commit = false)
                 scrubGestureEligible = false
+                touchGestureEligible = false
                 return wasScrubbing
             }
         }
         return false
+    }
+
+    private fun beginVerticalGesture(view: View, event: MotionEvent) {
+        verticalGestureCaptured = true
+        verticalGestureSide = if (event.x < view.width / 2f) -1 else 1
+        verticalGestureStartValue = if (verticalGestureSide < 0) {
+            currentWindowBrightness()
+        } else {
+            if (isMuted) 0f else (controller?.volume ?: lastVolume)
+        }
+        updateVerticalGesture(view, event)
+    }
+
+    private fun updateVerticalGesture(view: View, event: MotionEvent) {
+        if (!verticalGestureCaptured) return
+        val deltaFraction = (scrubStartY - event.y) /
+            view.height.coerceAtLeast(1).toFloat()
+        val value = (verticalGestureStartValue + deltaFraction).coerceIn(0f, 1f)
+        val percent = (value * 100f).roundToInt()
+        if (verticalGestureSide < 0) {
+            setWindowBrightness(value)
+            showScrubOverlay("亮度 $percent%", hideAfterMs = null)
+        } else {
+            setPlayerVolume(value)
+            showScrubOverlay("音量 $percent%", hideAfterMs = null)
+        }
+    }
+
+    private fun finishVerticalGesture() {
+        val value = if (verticalGestureSide < 0) {
+            currentWindowBrightness()
+        } else {
+            if (isMuted) 0f else (controller?.volume ?: lastVolume)
+        }
+        val label = if (verticalGestureSide < 0) "亮度" else "音量"
+        showScrubOverlay("$label ${(value * 100f).roundToInt()}%", hideAfterMs = 700L)
+        verticalGestureCaptured = false
+        verticalGestureSide = 0
+    }
+
+    private fun setPlayerVolume(value: Float) {
+        val volume = value.coerceIn(0f, 1f)
+        controller?.volume = volume
+        if (volume > 0f) {
+            lastVolume = volume
+            isMuted = false
+        } else {
+            isMuted = true
+        }
+        updateSpeakerButton()
+        persistControlSettings()
+    }
+
+    private fun currentWindowBrightness(): Float {
+        val windowValue = window.attributes.screenBrightness
+        if (windowValue in 0f..1f) return windowValue
+        return try {
+            Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f
+        } catch (_: Exception) {
+            0.5f
+        }
+    }
+
+    private fun setWindowBrightness(value: Float) {
+        window.attributes = window.attributes.apply {
+            screenBrightness = value.coerceIn(0f, 1f)
+        }
+    }
+
+    private fun isPlayerControlTouch(view: View, event: MotionEvent): Boolean {
+        val controlIds = intArrayOf(
+            androidx.media3.ui.R.id.exo_bottom_bar,
+            androidx.media3.ui.R.id.exo_center_controls,
+            androidx.media3.ui.R.id.exo_minimal_controls
+        )
+        return controlIds.any { id ->
+            view.findViewById<View>(id)?.takeIf { it.isShown }?.let {
+                isTouchInsideView(it, event)
+            } == true
+        }
+    }
+
+    private fun isTouchInsideView(target: View, event: MotionEvent): Boolean {
+        val location = IntArray(2)
+        target.getLocationOnScreen(location)
+        return event.rawX >= location[0] &&
+            event.rawX <= location[0] + target.width &&
+            event.rawY >= location[1] &&
+            event.rawY <= location[1] + target.height
     }
 
     private fun isProgressBarTouch(view: View, event: MotionEvent): Boolean {
