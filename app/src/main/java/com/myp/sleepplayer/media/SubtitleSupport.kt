@@ -13,6 +13,8 @@ internal data class SubtitleCue(
 )
 
 internal object SubtitleParser {
+    private val webVttTimingPattern = Regex("^\\s*(\\S+)\\s+-->\\s+(\\S+)(?:\\s+.*)?$")
+
     fun parseLrc(lines: List<String>): List<SubtitleCue> {
         val offsetMs = lines.asSequence()
             .mapNotNull { line -> lrcOffsetPattern.find(line)?.groupValues?.getOrNull(1)?.toLongOrNull() }
@@ -42,6 +44,13 @@ internal object SubtitleParser {
         }
     }
 
+    fun parseWebVttCueStarts(lines: List<String>): List<Long> = lines.mapNotNull { line ->
+        val match = webVttTimingPattern.matchEntire(line) ?: return@mapNotNull null
+        val start = parseWebVttTimestamp(match.groupValues[1]) ?: return@mapNotNull null
+        val end = parseWebVttTimestamp(match.groupValues[2]) ?: return@mapNotNull null
+        start.takeIf { end > start }
+    }.distinct().sorted()
+
     fun toWebVtt(cues: List<SubtitleCue>): String = buildString {
         append("WEBVTT\n\n")
         cues.forEach { cue ->
@@ -52,6 +61,25 @@ internal object SubtitleParser {
             append(cue.text)
             append("\n\n")
         }
+    }
+}
+
+internal fun parseWebVttTimestamp(timestamp: String): Long? {
+    val parts = timestamp.split(':')
+    if (parts.size !in 2..3) return null
+    val secondParts = parts.last().split('.', limit = 2)
+    if (secondParts.size != 2) return null
+    val seconds = secondParts[0].toLongOrNull()?.takeIf { it in 0L..59L } ?: return null
+    val fractionText = secondParts[1]
+    if (fractionText.isEmpty() || fractionText.length > 3 || !fractionText.all(Char::isDigit)) return null
+    val fraction = fractionText.padEnd(3, '0').toLongOrNull() ?: return null
+    return if (parts.size == 2) {
+        val minutes = parts[0].toLongOrNull()?.takeIf { it >= 0L } ?: return null
+        minutes * 60_000L + seconds * 1_000L + fraction
+    } else {
+        val hours = parts[0].toLongOrNull()?.takeIf { it >= 0L } ?: return null
+        val minutes = parts[1].toLongOrNull()?.takeIf { it in 0L..59L } ?: return null
+        hours * 3_600_000L + minutes * 60_000L + seconds * 1_000L + fraction
     }
 }
 

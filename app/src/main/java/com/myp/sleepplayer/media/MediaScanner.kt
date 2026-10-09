@@ -65,19 +65,26 @@ internal class MediaScanner(
     }
 
     private fun buildSubtitleFile(name: String, uri: Uri): SubtitleFile? {
-        if (isExtension(name, "vtt")) return SubtitleFile(name, uri)
+        if (isExtension(name, "vtt")) {
+            val cueStarts = readSubtitleLines(uri)
+                ?.let(SubtitleParser::parseWebVttCueStarts)
+                .orEmpty()
+            return SubtitleFile(name, uri, cueStarts)
+        }
         if (!isExtension(name, "lrc")) return null
         return convertLrcSubtitle(name, uri)
     }
 
+    private fun readSubtitleLines(uri: Uri): List<String>? = try {
+        contentResolver.openInputStream(uri)?.use { input ->
+            BufferedReader(InputStreamReader(input, StandardCharsets.UTF_8)).readLines()
+        }
+    } catch (_: Exception) {
+        null
+    }
+
     private fun convertLrcSubtitle(name: String, sourceUri: Uri): SubtitleFile? {
-        val lines = try {
-            contentResolver.openInputStream(sourceUri)?.use { input ->
-                BufferedReader(InputStreamReader(input, StandardCharsets.UTF_8)).readLines()
-            }
-        } catch (_: Exception) {
-            null
-        } ?: return null
+        val lines = readSubtitleLines(sourceUri) ?: return null
 
         val cues = SubtitleParser.parseLrc(lines)
         if (cues.isEmpty()) return null
@@ -87,7 +94,7 @@ internal class MediaScanner(
         val cacheFile = File(cacheDirectory, cacheName)
         return try {
             cacheFile.writeText(vtt, StandardCharsets.UTF_8)
-            SubtitleFile(name, Uri.fromFile(cacheFile))
+            SubtitleFile(name, Uri.fromFile(cacheFile), cues.map { it.startMs })
         } catch (_: Exception) {
             null
         }

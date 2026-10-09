@@ -54,7 +54,11 @@ internal fun isDefaultSubtitle(videoName: String, subtitleName: String): Boolean
     return subtitleStem == videoStem || subtitleStem == "$videoStem.$extension"
 }
 
-internal data class SubtitleFile(val name: String, val uri: Uri) {
+internal data class SubtitleFile(
+    val name: String,
+    val uri: Uri,
+    val cueStartTimesMs: List<Long> = emptyList()
+) {
     fun isDefaultFor(videoName: String): Boolean = isDefaultSubtitle(videoName, name)
 }
 

@@ -23,6 +23,12 @@ internal class SubtitlePreferencesStore(private val preferences: SharedPreferenc
         preferences.edit().putBoolean(KEY_OVERLAY_ENABLED, enabled).apply()
     }
 
+    fun snapSeekToCueStarts(): Boolean = preferences.getBoolean(KEY_SNAP_SEEK_TO_CUE_STARTS, false)
+
+    fun setSnapSeekToCueStarts(enabled: Boolean) {
+        preferences.edit().putBoolean(KEY_SNAP_SEEK_TO_CUE_STARTS, enabled).apply()
+    }
+
     fun save(settings: SubtitleSettings) {
         preferences.edit()
             .putBoolean(KEY_OVERLAY_ENABLED, settings.overlayEnabled)
@@ -39,5 +45,6 @@ internal class SubtitlePreferencesStore(private val preferences: SharedPreferenc
         const val KEY_COLOR = "subtitle_color"
         const val KEY_BACKGROUND_ALPHA = "subtitle_background_alpha"
         const val KEY_BOTTOM = "subtitle_bottom"
+        const val KEY_SNAP_SEEK_TO_CUE_STARTS = "snap_seek_to_cue_starts"
     }
 }

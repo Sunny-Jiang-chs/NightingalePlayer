@@ -6,6 +6,7 @@
 
 - 精确 seek：使用 Media3 `SeekParameters.EXACT`，低帧率视频会从前一关键帧解码到目标位置；在视频画面上左右滑动可快进或回退，距离越长跳转越远。
 - 自动字幕：同目录匹配 `video.vtt`、`video.wav.vtt`、`video.zh.vtt` 等文件；同名 `.lrc` 歌词（含 `[offset:]` 与一行多时间戳）会自动转成 WebVTT 使用。
+- 字幕定位：可在“字幕设置”启用“有字幕时，滑动对齐字幕起始点”；横向拖动会将目标位置吸附到当前媒体匹配到的 VTT/LRC cue 起点，关闭时保持连续 seek。
 - 画面控制：播放器控制栏提供全屏和设置入口；设置菜单可调整画面适配、裁剪、拉伸、双指缩放、倍速、增益、定时和字幕，全屏时也可使用。
 - 隐藏目录：应用内目录浏览器可显示点号开头的目录；需由用户主动授予“所有文件访问”。
 - 音频控制：播放器控制栏的独立喇叭图标打开竖向音量滑杆；设置菜单另支持原声、+6/+12 dB 增益和 0.5x 到 2x 倍速。
@@ -33,7 +34,8 @@ com.myp.sleepplayer
     ├── PlaybackStateStore.kt   播放位置快照的 SharedPreferences 读写
     ├── PlaybackControlStore.kt 音量、倍速、增益和画面模式偏好
     ├── SleepTimerStore.kt      定时截止时间偏好
-    └── SubtitlePreferencesStore.kt 字幕样式与悬浮显示偏好
+    ├── SubtitlePreferencesStore.kt 字幕样式、悬浮显示和字幕定位偏好
+    └── SubtitleSeekSnapper.kt  横向 seek 目标吸附到 cue 起点
 ```
 
 `MainActivity` 仍负责页面、Android 生命周期、播放器手势与控件交互，并协调扫描结果展示。媒体扫描、字幕处理和播放列表/恢复逻辑已移出 Activity：`MediaScanner` 将普通文件目录与系统目录授权（SAF）目录统一转换为 `MediaEntry`；`MediaItemMapper` 负责把应用媒体模型映射到 Media3 `MediaItem`。`PlaybackCoordinator` 集中管理播放列表和恢复决策，`PlaybackStateStore` 保留原有播放位置键和值；`PlaybackControlStore`、`SleepTimerStore` 和 `SubtitlePreferencesStore` 分别集中管理现有偏好文件中的控制、定时和字幕设置。`PlaybackService` 继续拥有实际播放器和后台播放生命周期。
@@ -50,7 +52,7 @@ PlaybackService ──> Media3 player/session
 
 服务命令仍通过现有的 `Intent` action 在 Activity 与 `PlaybackService` 之间传递；偏好 store 只负责持久化，不替代服务命令通道。Activity 通过 `PlaybackControlStore` 保存音量、静音、倍速、增益和画面模式；`PlaybackService` 通过同一 store 在处理增益命令时保存增益。定时和字幕设置由 `PlaybackService` 写入对应 store，Activity 读取这些值用于显示。后续扩展优先将纯字幕时间轴与 cue 查找放入 `media`，将 seek 策略放入 `playback`，UI 只发出操作并显示结果；只有在职责和依赖稳定后再考虑继续拆分手势、设置弹窗或 Service 管理器。当前分层不改变支持的媒体格式、扫描顺序、字幕匹配规则、LRC 转换缓存、播放恢复或现有控制行为。
 
-字幕解析自检可运行 `gradlew.bat :app:verifySubtitleSupport`，覆盖 LRC offset、多时间戳、重复起点、末尾 cue 时长及 WebVTT 输出。
+字幕与定位自检可运行 `gradlew.bat :app:verifySubtitleSupport`，覆盖 LRC offset、多时间戳、VTT cue 起点、重复起点、末尾 cue 时长、WebVTT 输出和最近字幕起点吸附。
 
 ## 模拟器调试
 

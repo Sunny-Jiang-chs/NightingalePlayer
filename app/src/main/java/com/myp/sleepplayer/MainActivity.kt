@@ -75,6 +75,7 @@ import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
 import com.myp.sleepplayer.playback.PlaybackStateStore
 import com.myp.sleepplayer.playback.SleepTimerStore
 import com.myp.sleepplayer.playback.SubtitlePreferencesStore
+import com.myp.sleepplayer.playback.SubtitleSeekSnapper
 import com.myp.sleepplayer.playback.SubtitleSettings
 import java.io.File
 import java.util.Locale
@@ -218,6 +219,7 @@ class MainActivity : Activity() {
     private var libraryContainer: LinearLayout? = null
     private var timerCountdownView: TextView? = null
     private var timerDialog: AlertDialog? = null
+    private var playbackButton: ImageButton? = null
     private var speakerButton: ImageButton? = null
     private var volumePopup: PopupWindow? = null
     private var scrubOverlayView: TextView? = null
@@ -230,6 +232,7 @@ class MainActivity : Activity() {
     private var playbackSpeed = 1f
     private var gainDb = 0
     private var subtitleOverlayEnabled = false
+    private var snapSeekToCueStarts = false
     private var videoPreviewCollapsed = false
     private var audioSectionCollapsed = false
     private var subtitleSizeSp = 20f
@@ -262,6 +265,8 @@ class MainActivity : Activity() {
     private var scrubStartPosition = 0L
     private var scrubTargetPosition = 0L
     private var scrubDuration = 0L
+    private var scrubSnapper: SubtitleSeekSnapper? = null
+    private var scrubWasSnapped = false
     private var scaleDetector: ScaleGestureDetector? = null
 
     private val longPressSpeedBoostRunnable = Runnable {
@@ -315,6 +320,7 @@ class MainActivity : Activity() {
         currentResizeMode = playbackSettings.resizeMode
         val subtitleSettings = subtitlePreferencesStore.read(Color.WHITE)
         subtitleOverlayEnabled = subtitleSettings.overlayEnabled
+        snapSeekToCueStarts = subtitlePreferencesStore.snapSeekToCueStarts()
         subtitleSizeSp = subtitleSettings.sizeSp
         subtitleColor = subtitleSettings.color
         subtitleBackgroundAlpha = subtitleSettings.backgroundAlpha
@@ -448,6 +454,28 @@ class MainActivity : Activity() {
         }
         updateSpeakerButton()
 
+        playbackButton = ImageButton(this).apply {
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = "播放"
+            val selectableBackground = TypedValue()
+            theme.resolveAttribute(
+                android.R.attr.selectableItemBackgroundBorderless,
+                selectableBackground,
+                true
+            )
+            setBackgroundResource(selectableBackground.resourceId)
+            imageTintList = android.content.res.ColorStateList.valueOf(Color.rgb(220, 228, 237))
+            setOnClickListener {
+                controller?.let { player ->
+                    val playbackRequested = player.playWhenReady &&
+                        player.playbackState != Player.STATE_ENDED
+                    if (playbackRequested) player.pause() else player.play()
+                }
+            }
+        }
+        updatePlaybackButton()
+
         timingView = TextView(this).apply {
             text = "00:00 / --:--"
             textSize = 12f
@@ -479,6 +507,8 @@ class MainActivity : Activity() {
                 controller = controllerFuture?.get()
                 controller?.let(playbackCoordinator::attach)
                 playerView?.player = controller
+                installCompactController()
+                attachPlaybackButtonToPlayerControls()
                 attachSpeakerButtonToPlayerControls()
                 attachSettingsButtonToPlayerControls()
                 stylePlayerControls()
@@ -494,6 +524,15 @@ class MainActivity : Activity() {
 
                     override fun onIsPlayingChanged(isPlaying: Boolean) {
                         updateScreenAwakeState()
+                        updatePlaybackButton()
+                    }
+
+                    override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                        updatePlaybackButton()
+                    }
+
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        updatePlaybackButton()
                     }
 
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -1254,6 +1293,11 @@ class MainActivity : Activity() {
             text = "退到后台时显示悬浮字幕"
             isChecked = subtitleOverlayEnabled
         }
+        val snapSeekCheck = CheckBox(this).apply {
+            text = "有字幕时，滑动对齐字幕起始点"
+            isChecked = snapSeekToCueStarts
+        }
+        panel.addView(snapSeekCheck)
         panel.addView(overlayCheck)
         panel.addView(Button(this).apply {
             text = "授权悬浮字幕显示"
@@ -1327,6 +1371,8 @@ class MainActivity : Activity() {
             .setPositiveButton("保存") { _, _ ->
                 val canOverlay = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
                 subtitleOverlayEnabled = overlayCheck.isChecked && canOverlay
+                snapSeekToCueStarts = snapSeekCheck.isChecked
+                subtitlePreferencesStore.setSnapSeekToCueStarts(snapSeekToCueStarts)
                 if (overlayCheck.isChecked && !canOverlay) {
                     Toast.makeText(this, "请先授权悬浮窗权限，后台字幕才会显示", Toast.LENGTH_LONG).show()
                 }
@@ -1486,14 +1532,53 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updatePlaybackButton() {
+        val player = controller
+        val playbackRequested = player?.playWhenReady == true &&
+            player.playbackState != Player.STATE_ENDED
+        playbackButton?.apply {
+            setImageResource(
+                if (playbackRequested) androidx.media3.ui.R.drawable.exo_icon_pause
+                else androidx.media3.ui.R.drawable.exo_icon_play
+            )
+            contentDescription = if (playbackRequested) "暂停播放" else "播放"
+        }
+    }
+
     private fun stylePlayerControls() {
         val video = playerView ?: return
+        video.findViewById<View>(androidx.media3.ui.R.id.exo_center_controls)?.visibility = View.GONE
         video.findViewById<View>(androidx.media3.ui.R.id.exo_controls_background)?.apply {
             background = ColorDrawable(Color.TRANSPARENT)
         }
         video.findViewById<View>(androidx.media3.ui.R.id.exo_bottom_bar)?.apply {
             background = ColorDrawable(Color.argb(112, 13, 15, 18))
         }
+    }
+
+    private fun installCompactController() {
+        val video = playerView ?: return
+        video.setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
+            if (visibility == View.VISIBLE) {
+                video.findViewById<View>(androidx.media3.ui.R.id.exo_center_controls)?.visibility = View.GONE
+            }
+        })
+        stylePlayerControls()
+    }
+
+    private fun attachPlaybackButtonToPlayerControls() {
+        val video = playerView ?: return
+        val timeControls = video.findViewById<ViewGroup>(androidx.media3.ui.R.id.exo_time) ?: return
+        val position = video.findViewById<View>(androidx.media3.ui.R.id.exo_position) ?: return
+        val button = playbackButton ?: return
+        if (button.parent === timeControls) return
+
+        (button.parent as? ViewGroup)?.removeView(button)
+        val templateParams = video.findViewById<View>(androidx.media3.ui.R.id.exo_settings)
+            ?.layoutParams
+        val params = templateParams?.let { ViewGroup.LayoutParams(it) }
+            ?: ViewGroup.LayoutParams(dp(48), dp(48))
+        timeControls.addView(button, timeControls.indexOfChild(position).coerceAtLeast(0), params)
     }
 
     private fun attachSpeakerButtonToPlayerControls() {
@@ -1815,7 +1900,19 @@ class MainActivity : Activity() {
                 scrubStartY = event.y
                 scrubStartPosition = player?.currentPosition?.coerceAtLeast(0L) ?: 0L
                 scrubTargetPosition = scrubStartPosition
+                scrubWasSnapped = false
                 scrubDuration = player?.duration?.coerceAtLeast(0L) ?: 0L
+                scrubSnapper = if (snapSeekToCueStarts && player != null) {
+                    val currentUri = player.currentMediaItem?.localConfiguration?.uri?.toString()
+                    val cueStarts = loadedEntries
+                        .firstOrNull { it.uri.toString() == currentUri }
+                        ?.subtitles
+                        ?.flatMap { it.cueStartTimesMs }
+                        .orEmpty()
+                    SubtitleSeekSnapper(cueStarts, scrubDuration).takeIf { it.isAvailable }
+                } else {
+                    null
+                }
                 if (touchGestureEligible &&
                     !doubleTapGestureCaptured &&
                     player?.isPlaying == true
@@ -1879,8 +1976,15 @@ class MainActivity : Activity() {
                 val width = view.width.coerceAtLeast(1).toDouble()
                 val seekPerViewWidth = (scrubDuration / 10L).coerceAtMost(60_000L)
                 val proportionalOffset = (seekPerViewWidth.toDouble() * deltaX / width).toLong()
-                scrubTargetPosition = (scrubStartPosition + proportionalOffset)
+                val rawTarget = (scrubStartPosition + proportionalOffset)
                     .coerceIn(0L, scrubDuration)
+                val snappedTarget = scrubSnapper?.snap(
+                    rawTarget,
+                    scrubStartPosition,
+                    deltaX.compareTo(0f)
+                )
+                scrubTargetPosition = snappedTarget ?: rawTarget
+                scrubWasSnapped = snappedTarget != null && snappedTarget != rawTarget
                 timingView?.text = "${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
                 updateScrubOverlay()
                 return true
@@ -2059,20 +2163,23 @@ class MainActivity : Activity() {
         if (commit && player != null && scrubDuration > 0L) {
             player.seekTo(scrubTargetPosition)
             timingView?.text = "${formatTime(scrubTargetPosition)} / ${formatTime(scrubDuration)}"
-            showScrubOverlay("已跳转\n${scrubPositionLabel()}", hideAfterMs = 1_200L)
+            val result = if (scrubWasSnapped) "已对齐字幕起点" else "已跳转"
+            showScrubOverlay("$result\n${scrubPositionLabel()}", hideAfterMs = 1_200L)
         } else {
             timingView?.text = "${formatTime(player?.currentPosition ?: 0L)} / ${formatTime(player?.duration ?: 0L)}"
             hideScrubOverlay()
         }
         isSeeking = false
         scrubGestureCaptured = false
+        scrubSnapper = null
     }
 
     private fun updateScrubOverlay() {
         val delta = scrubTargetPosition - scrubStartPosition
         val direction = if (delta >= 0L) "快进" else "回退"
         val signedDelta = if (delta >= 0L) "+${formatTime(delta)}" else "-${formatTime(-delta)}"
-        showScrubOverlay("$direction $signedDelta\n${scrubPositionLabel()}", hideAfterMs = null)
+        val alignment = if (scrubWasSnapped) "\n字幕起点" else ""
+        showScrubOverlay("$direction $signedDelta\n${scrubPositionLabel()}$alignment", hideAfterMs = null)
     }
 
     private fun scrubPositionLabel(): String =
