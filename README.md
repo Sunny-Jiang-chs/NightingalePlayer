@@ -15,6 +15,43 @@
 - 播放恢复：退到后台或重新进入应用时恢复媒体、位置和播放状态。
 - MP4 预览：媒体库将 MP4 与 MP3/WAV 分开展示，并在每个 MP4 条目旁直接显示视频首帧缩略图。
 
+## 代码架构
+
+应用按职责拆分为同一 Android app module 下的几个 package；暂不增加 Gradle module，以控制依赖和构建复杂度。
+
+```text
+com.myp.sleepplayer
+├── MainActivity.kt             页面组装、生命周期、用户交互和 Android UI
+├── PlaybackService.kt          MediaSession/ExoPlayer 生命周期、后台播放与服务命令
+├── media/
+│   ├── MediaModels.kt          媒体/字幕数据模型和文件类型
+│   ├── MediaItemMapper.kt      应用媒体模型到 Media3 MediaItem 的适配
+│   ├── MediaScanner.kt         File 与 SAF 目录扫描、字幕匹配、LRC 转 VTT 与缓存
+│   └── SubtitleSupport.kt      LRC 时间戳解析和 WebVTT 时间格式化
+└── playback/
+    ├── PlaybackCoordinator.kt  播放列表装载、恢复决策和条目播放
+    ├── PlaybackStateStore.kt   播放位置快照的 SharedPreferences 读写
+    ├── PlaybackControlStore.kt 音量、倍速、增益和画面模式偏好
+    ├── SleepTimerStore.kt      定时截止时间偏好
+    └── SubtitlePreferencesStore.kt 字幕样式与悬浮显示偏好
+```
+
+`MainActivity` 仍负责页面、Android 生命周期、播放器手势与控件交互，并协调扫描结果展示。媒体扫描、字幕处理和播放列表/恢复逻辑已移出 Activity：`MediaScanner` 将普通文件目录与系统目录授权（SAF）目录统一转换为 `MediaEntry`；`MediaItemMapper` 负责把应用媒体模型映射到 Media3 `MediaItem`。`PlaybackCoordinator` 集中管理播放列表和恢复决策，`PlaybackStateStore` 保留原有播放位置键和值；`PlaybackControlStore`、`SleepTimerStore` 和 `SubtitlePreferencesStore` 分别集中管理现有偏好文件中的控制、定时和字幕设置。`PlaybackService` 继续拥有实际播放器和后台播放生命周期。
+
+依赖方向以 UI 调用媒体和播放能力为主：
+
+```text
+MainActivity ──> media models / MediaScanner
+MainActivity ──> PlaybackCoordinator ──> PlaybackStateStore
+PlaybackCoordinator ──> media models
+MainActivity / PlaybackService ──> preference stores
+PlaybackService ──> Media3 player/session
+```
+
+服务命令仍通过现有的 `Intent` action 在 Activity 与 `PlaybackService` 之间传递；偏好 store 只负责持久化，不替代服务命令通道。Activity 通过 `PlaybackControlStore` 保存音量、静音、倍速、增益和画面模式；`PlaybackService` 通过同一 store 在处理增益命令时保存增益。定时和字幕设置由 `PlaybackService` 写入对应 store，Activity 读取这些值用于显示。后续扩展优先将纯字幕时间轴与 cue 查找放入 `media`，将 seek 策略放入 `playback`，UI 只发出操作并显示结果；只有在职责和依赖稳定后再考虑继续拆分手势、设置弹窗或 Service 管理器。当前分层不改变支持的媒体格式、扫描顺序、字幕匹配规则、LRC 转换缓存、播放恢复或现有控制行为。
+
+字幕解析自检可运行 `gradlew.bat :app:verifySubtitleSupport`，覆盖 LRC offset、多时间戳、重复起点、末尾 cue 时长及 WebVTT 输出。
+
 ## 模拟器调试
 
 环境默认使用 `D:\tools\android-sdk` 和 AVD `northward_api36`。

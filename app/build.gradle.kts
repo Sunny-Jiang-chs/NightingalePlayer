@@ -45,3 +45,12 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.5.1")
     implementation("androidx.media3:media3-session:1.5.1")
 }
+
+tasks.register<JavaExec>("verifySubtitleSupport") {
+    dependsOn("compileDebugUnitTestKotlin")
+    classpath = files(
+        layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
+        layout.buildDirectory.dir("tmp/kotlin-classes/debug")
+    ) + configurations.getByName("debugUnitTestRuntimeClasspath")
+    mainClass.set("com.myp.sleepplayer.media.SubtitleSupportTest")
+}

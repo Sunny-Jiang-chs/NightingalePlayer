@@ -19,6 +19,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import com.myp.sleepplayer.playback.PlaybackControlStore
+import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
+import com.myp.sleepplayer.playback.SleepTimerStore
+import com.myp.sleepplayer.playback.SubtitlePreferencesStore
+import com.myp.sleepplayer.playback.SubtitleSettings
 
 @UnstableApi
 class PlaybackService : MediaSessionService() {
@@ -36,16 +41,6 @@ class PlaybackService : MediaSessionService() {
         const val EXTRA_SUBTITLE_COLOR = "subtitle_color"
         const val EXTRA_SUBTITLE_BACKGROUND_ALPHA = "subtitle_background_alpha"
         const val EXTRA_SUBTITLE_BOTTOM = "subtitle_bottom"
-        private const val TIMER_PREFS = "sleep_timer"
-        private const val TIMER_DEADLINE = "deadline_ms"
-        private const val CONTROL_PREFS = "playback_controls"
-        private const val GAIN_DB = "gain_db"
-        private const val SUBTITLE_PREFS = "subtitle_preferences"
-        private const val OVERLAY_ENABLED = "overlay_enabled"
-        private const val SUBTITLE_SIZE = "subtitle_size"
-        private const val SUBTITLE_COLOR = "subtitle_color"
-        private const val SUBTITLE_BACKGROUND_ALPHA = "subtitle_background_alpha"
-        private const val SUBTITLE_BOTTOM = "subtitle_bottom"
         private const val TAG = "SleepVideoPlayer"
     }
 
@@ -64,27 +59,26 @@ class PlaybackService : MediaSessionService() {
     private var subtitleOverlay: TextView? = null
     private var overlayParams: WindowManager.LayoutParams? = null
     private val windowManager by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+    private val sleepTimerStore by lazy {
+        SleepTimerStore(getSharedPreferences(PlaybackPreferenceFiles.SLEEP_TIMER, MODE_PRIVATE))
+    }
+    private val playbackControlStore by lazy {
+        PlaybackControlStore(getSharedPreferences(PlaybackPreferenceFiles.CONTROLS, MODE_PRIVATE))
+    }
+    private val subtitlePreferencesStore by lazy {
+        SubtitlePreferencesStore(getSharedPreferences(PlaybackPreferenceFiles.SUBTITLES, MODE_PRIVATE))
+    }
 
     private val timerRunnable = Runnable {
-        getSharedPreferences(TIMER_PREFS, MODE_PRIVATE)
-            .edit()
-            .remove(TIMER_DEADLINE)
-            .apply()
+        sleepTimerStore.clear()
         player.pause()
         stopSelf()
     }
 
     override fun onCreate() {
         super.onCreate()
-        gainDb = getSharedPreferences(CONTROL_PREFS, MODE_PRIVATE)
-            .getInt(GAIN_DB, 0)
-            .coerceIn(0, 12)
-        val subtitlePrefs = getSharedPreferences(SUBTITLE_PREFS, MODE_PRIVATE)
-        overlayEnabled = subtitlePrefs.getBoolean(OVERLAY_ENABLED, false)
-        subtitleSizeSp = subtitlePrefs.getFloat(SUBTITLE_SIZE, 20f).coerceIn(12f, 36f)
-        subtitleColor = subtitlePrefs.getInt(SUBTITLE_COLOR, Color.WHITE)
-        subtitleBackgroundAlpha = subtitlePrefs.getInt(SUBTITLE_BACKGROUND_ALPHA, 150).coerceIn(0, 255)
-        subtitleBottomDp = subtitlePrefs.getInt(SUBTITLE_BOTTOM, 42).coerceIn(8, 180)
+        gainDb = playbackControlStore.gainDb()
+        applySubtitleSettings(subtitlePreferencesStore.read(Color.WHITE))
         player = ExoPlayer.Builder(this)
             // Exact seek decodes forward from the previous keyframe instead of
             // snapping to a distant sync point in low-frame-rate files.
@@ -137,20 +131,18 @@ class PlaybackService : MediaSessionService() {
 
     private fun setTimer(minutes: Int) {
         timerHandler.removeCallbacks(timerRunnable)
-        val prefs = getSharedPreferences(TIMER_PREFS, MODE_PRIVATE)
         if (minutes <= 0) {
-            prefs.edit().remove(TIMER_DEADLINE).apply()
+            sleepTimerStore.clear()
             return
         }
 
         val deadline = System.currentTimeMillis() + minutes * 60_000L
-        prefs.edit().putLong(TIMER_DEADLINE, deadline).apply()
+        sleepTimerStore.setDeadline(deadline)
         timerHandler.postDelayed(timerRunnable, minutes * 60_000L)
     }
 
     private fun restoreTimer() {
-        val deadline = getSharedPreferences(TIMER_PREFS, MODE_PRIVATE)
-            .getLong(TIMER_DEADLINE, 0L)
+        val deadline = sleepTimerStore.deadlineMs()
         if (deadline == 0L) return
         val remaining = deadline - System.currentTimeMillis()
         if (remaining <= 0L) {
@@ -162,10 +154,7 @@ class PlaybackService : MediaSessionService() {
 
     private fun setGain(db: Int) {
         gainDb = db.coerceIn(0, 12)
-        getSharedPreferences(CONTROL_PREFS, MODE_PRIVATE)
-            .edit()
-            .putInt(GAIN_DB, gainDb)
-            .apply()
+        playbackControlStore.saveGainDb(gainDb)
         if (::player.isInitialized) {
             val audioSessionId = player.audioSessionId
             if (audioSessionId != C.AUDIO_SESSION_ID_UNSET) {
@@ -202,29 +191,42 @@ class PlaybackService : MediaSessionService() {
 
     private fun setOverlayEnabled(enabled: Boolean) {
         overlayEnabled = enabled
-        getSharedPreferences(SUBTITLE_PREFS, MODE_PRIVATE)
-            .edit()
-            .putBoolean(OVERLAY_ENABLED, enabled)
-            .apply()
+        subtitlePreferencesStore.setOverlayEnabled(enabled)
         updateSubtitleOverlay()
     }
 
     private fun updateSubtitleStyle(intent: Intent) {
-        subtitleSizeSp = intent.getFloatExtra(EXTRA_SUBTITLE_SIZE, subtitleSizeSp).coerceIn(12f, 36f)
-        subtitleColor = intent.getIntExtra(EXTRA_SUBTITLE_COLOR, subtitleColor)
-        subtitleBackgroundAlpha = intent.getIntExtra(
-            EXTRA_SUBTITLE_BACKGROUND_ALPHA,
-            subtitleBackgroundAlpha
-        ).coerceIn(0, 255)
-        subtitleBottomDp = intent.getIntExtra(EXTRA_SUBTITLE_BOTTOM, subtitleBottomDp).coerceIn(8, 180)
-        getSharedPreferences(SUBTITLE_PREFS, MODE_PRIVATE).edit()
-            .putFloat(SUBTITLE_SIZE, subtitleSizeSp)
-            .putInt(SUBTITLE_COLOR, subtitleColor)
-            .putInt(SUBTITLE_BACKGROUND_ALPHA, subtitleBackgroundAlpha)
-            .putInt(SUBTITLE_BOTTOM, subtitleBottomDp)
-            .apply()
+        applySubtitleSettings(
+            SubtitleSettings(
+                overlayEnabled = overlayEnabled,
+                sizeSp = intent.getFloatExtra(EXTRA_SUBTITLE_SIZE, subtitleSizeSp).coerceIn(12f, 36f),
+                color = intent.getIntExtra(EXTRA_SUBTITLE_COLOR, subtitleColor),
+                backgroundAlpha = intent.getIntExtra(
+                    EXTRA_SUBTITLE_BACKGROUND_ALPHA,
+                    subtitleBackgroundAlpha
+                ).coerceIn(0, 255),
+                bottomDp = intent.getIntExtra(EXTRA_SUBTITLE_BOTTOM, subtitleBottomDp).coerceIn(8, 180)
+            )
+        )
+        subtitlePreferencesStore.save(
+            SubtitleSettings(
+                overlayEnabled = overlayEnabled,
+                sizeSp = subtitleSizeSp,
+                color = subtitleColor,
+                backgroundAlpha = subtitleBackgroundAlpha,
+                bottomDp = subtitleBottomDp
+            )
+        )
         applySubtitleStyle()
         updateSubtitleOverlay()
+    }
+
+    private fun applySubtitleSettings(settings: SubtitleSettings) {
+        overlayEnabled = settings.overlayEnabled
+        subtitleSizeSp = settings.sizeSp
+        subtitleColor = settings.color
+        subtitleBackgroundAlpha = settings.backgroundAlpha
+        subtitleBottomDp = settings.bottomDp
     }
 
     private fun canDrawOverlays(): Boolean =

@@ -55,10 +55,6 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.ViewCompat
 import androidx.documentfile.provider.DocumentFile
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MediaMetadata
-import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
@@ -67,78 +63,26 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.google.common.util.concurrent.ListenableFuture
-import java.io.BufferedReader
+import com.myp.sleepplayer.media.MediaEntry
+import com.myp.sleepplayer.media.MediaScanner
+import com.myp.sleepplayer.media.isExtension
+import com.myp.sleepplayer.media.isSupportedMedia
+import com.myp.sleepplayer.media.isSubtitleFile
+import com.myp.sleepplayer.playback.PlaybackCoordinator
+import com.myp.sleepplayer.playback.PlaybackControlSettings
+import com.myp.sleepplayer.playback.PlaybackControlStore
+import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
+import com.myp.sleepplayer.playback.PlaybackStateStore
+import com.myp.sleepplayer.playback.SleepTimerStore
+import com.myp.sleepplayer.playback.SubtitlePreferencesStore
+import com.myp.sleepplayer.playback.SubtitleSettings
 import java.io.File
-import java.io.InputStreamReader
-import java.nio.charset.StandardCharsets
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
-
-private fun mediaStem(name: String): String =
-    name.substringBeforeLast('.', name).lowercase(Locale.ROOT)
-
-private fun mediaExtension(name: String): String =
-    name.substringAfterLast('.', "").lowercase(Locale.ROOT)
-
-private fun subtitleSuffix(videoName: String, subtitleName: String): String {
-    val videoStem = mediaStem(videoName)
-    val subtitleStem = mediaStem(subtitleName)
-    val rawSuffix = if (subtitleStem.startsWith("$videoStem.")) {
-        subtitleStem.substring(videoStem.length + 1)
-    } else {
-        ""
-    }
-    val extension = mediaExtension(videoName)
-    return when {
-        rawSuffix.equals(extension, ignoreCase = true) -> ""
-        rawSuffix.startsWith("$extension.", ignoreCase = true) ->
-            rawSuffix.substring(extension.length + 1)
-        else -> rawSuffix
-    }
-}
-
-private fun isDefaultSubtitle(videoName: String, subtitleName: String): Boolean {
-    val videoStem = mediaStem(videoName)
-    val subtitleStem = mediaStem(subtitleName)
-    val extension = mediaExtension(videoName)
-    return subtitleStem == videoStem || subtitleStem == "$videoStem.$extension"
-}
-
-private val lrcTimestampPattern = Regex("\\[(\\d{1,3}:\\d{2}(?::\\d{2})?(?:[.:]\\d{1,3})?)\\]")
-private val lrcOffsetPattern = Regex("^\\[offset:([-+]?\\d+)\\]", RegexOption.IGNORE_CASE)
-
-private fun parseLrcTimestamp(timestamp: String): Long? {
-    val parts = timestamp.split(':')
-    if (parts.size !in 2..3) return null
-    val secondParts = parts.last().split('.', limit = 2)
-    val seconds = secondParts[0].toLongOrNull() ?: return null
-    val fraction = secondParts.getOrNull(1)
-        ?.padEnd(3, '0')
-        ?.take(3)
-        ?.toLongOrNull()
-        ?: 0L
-    return if (parts.size == 2) {
-        val minutes = parts[0].toLongOrNull() ?: return null
-        minutes * 60_000L + seconds * 1_000L + fraction
-    } else {
-        val hours = parts[0].toLongOrNull() ?: return null
-        val minutes = parts[1].toLongOrNull() ?: return null
-        hours * 3_600_000L + minutes * 60_000L + seconds * 1_000L + fraction
-    }
-}
-
-private fun formatVttTimestamp(milliseconds: Long): String {
-    val safe = milliseconds.coerceAtLeast(0L)
-    val hours = safe / 3_600_000L
-    val minutes = (safe % 3_600_000L) / 60_000L
-    val seconds = (safe % 60_000L) / 1_000L
-    val millis = safe % 1_000L
-    return "%02d:%02d:%02d.%03d".format(Locale.ROOT, hours, minutes, seconds, millis)
-}
 
 private class VerticalVolumeSlider(
     context: Context,
@@ -257,16 +201,14 @@ class MainActivity : Activity() {
         private const val PREFS = "library"
         private const val TREE_URI = "tree_uri"
         private const val DIRECTORY_PATH = "directory_path"
-        private const val LAST_MEDIA_URI = "last_media_uri"
-        private const val LAST_MEDIA_POSITION = "last_media_position"
-        private const val LAST_MEDIA_PLAYING = "last_media_playing"
-        private const val TIMER_PREFS = "sleep_timer"
-        private const val TIMER_DEADLINE = "deadline_ms"
         private const val MAX_TIMER_MINUTES = 24 * 60
     }
 
     private val scanExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val thumbnailExecutor: ExecutorService = Executors.newFixedThreadPool(2)
+    private val mediaScanner by lazy {
+        MediaScanner(contentResolver, File(cacheDir, "lrc-subtitles"))
+    }
     private val mainHandler = Handler(Looper.getMainLooper())
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
@@ -333,7 +275,19 @@ class MainActivity : Activity() {
         }
     }
 
-    private val controlPrefs by lazy { getSharedPreferences("playback_controls", MODE_PRIVATE) }
+    private val playbackControlStore by lazy {
+        PlaybackControlStore(getSharedPreferences(PlaybackPreferenceFiles.CONTROLS, MODE_PRIVATE))
+    }
+    private val playbackStateStore by lazy {
+        PlaybackStateStore(getSharedPreferences(PlaybackPreferenceFiles.CONTROLS, MODE_PRIVATE))
+    }
+    private val playbackCoordinator by lazy { PlaybackCoordinator(playbackStateStore) }
+    private val sleepTimerStore by lazy {
+        SleepTimerStore(getSharedPreferences(PlaybackPreferenceFiles.SLEEP_TIMER, MODE_PRIVATE))
+    }
+    private val subtitlePreferencesStore by lazy {
+        SubtitlePreferencesStore(getSharedPreferences(PlaybackPreferenceFiles.SUBTITLES, MODE_PRIVATE))
+    }
 
     private val progressTicker = object : Runnable {
         override fun run() {
@@ -353,20 +307,18 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        lastVolume = controlPrefs.getFloat("volume", 1f).coerceIn(0f, 1f)
-        isMuted = controlPrefs.getBoolean("muted", false)
-        playbackSpeed = controlPrefs.getFloat("speed", 1f).coerceIn(0.5f, 2f)
-        gainDb = controlPrefs.getInt("gain_db", 0).coerceIn(0, 12)
-        val subtitlePrefs = getSharedPreferences("subtitle_preferences", MODE_PRIVATE)
-        subtitleOverlayEnabled = subtitlePrefs.getBoolean("overlay_enabled", false)
-        subtitleSizeSp = subtitlePrefs.getFloat("subtitle_size", 20f).coerceIn(12f, 36f)
-        subtitleColor = subtitlePrefs.getInt("subtitle_color", Color.WHITE)
-        subtitleBackgroundAlpha = subtitlePrefs.getInt("subtitle_background_alpha", 150).coerceIn(0, 255)
-        subtitleBottomDp = subtitlePrefs.getInt("subtitle_bottom", 42).coerceIn(8, 180)
-        currentResizeMode = controlPrefs.getInt(
-            "resize_mode",
-            AspectRatioFrameLayout.RESIZE_MODE_FIT
-        )
+        val playbackSettings = playbackControlStore.read(AspectRatioFrameLayout.RESIZE_MODE_FIT)
+        lastVolume = playbackSettings.volume
+        isMuted = playbackSettings.muted
+        playbackSpeed = playbackSettings.speed
+        gainDb = playbackSettings.gainDb
+        currentResizeMode = playbackSettings.resizeMode
+        val subtitleSettings = subtitlePreferencesStore.read(Color.WHITE)
+        subtitleOverlayEnabled = subtitleSettings.overlayEnabled
+        subtitleSizeSp = subtitleSettings.sizeSp
+        subtitleColor = subtitleSettings.color
+        subtitleBackgroundAlpha = subtitleSettings.backgroundAlpha
+        subtitleBottomDp = subtitleSettings.bottomDp
         buildUi()
         registerFullscreenBackHandler()
         connectController()
@@ -525,6 +477,7 @@ class MainActivity : Activity() {
         controllerFuture?.addListener({
             try {
                 controller = controllerFuture?.get()
+                controller?.let(playbackCoordinator::attach)
                 playerView?.player = controller
                 attachSpeakerButtonToPlayerControls()
                 attachSettingsButtonToPlayerControls()
@@ -553,7 +506,7 @@ class MainActivity : Activity() {
                 })
                 updateScreenAwakeState()
                 controller?.setPlaybackSpeed(playbackSpeed)
-                if (loadedEntries.isNotEmpty()) applyPlaylist()
+                if (loadedEntries.isNotEmpty()) playbackCoordinator.applyPlaylist(loadedEntries)
             } catch (error: Exception) {
                 Toast.makeText(
                     this@MainActivity,
@@ -801,7 +754,7 @@ class MainActivity : Activity() {
         scanFuture = scanExecutor.submit {
             val entries = try {
                 val root = DocumentFile.fromTreeUri(this, uri)
-                root?.let { scanDocumentDirectory(it) }.orEmpty()
+                root?.let { mediaScanner.scanDocumentDirectory(it) }.orEmpty()
             } catch (_: RuntimeException) {
                 emptyList()
             }
@@ -815,7 +768,7 @@ class MainActivity : Activity() {
         val requestId = beginScan()
         scanFuture = scanExecutor.submit {
             val entries = try {
-                scanFileDirectoryEntries(directory)
+                mediaScanner.scanFileDirectory(directory)
             } catch (_: RuntimeException) {
                 emptyList()
             }
@@ -859,160 +812,10 @@ class MainActivity : Activity() {
         container.addView(loading)
     }
 
-    private fun scanFileDirectoryEntries(directory: File): List<MediaEntry> {
-        if (Thread.currentThread().isInterrupted) return emptyList()
-        val children = try {
-            directory.listFiles()?.sortedBy { it.name.lowercase(Locale.ROOT) }.orEmpty()
-        } catch (_: SecurityException) {
-            emptyList()
-        }
-        val subtitles = children
-            .filter { it.isFile && isSubtitleFile(it.name) }
-            .mapNotNull { subtitle ->
-                buildSubtitleFile(subtitle.name, Uri.fromFile(subtitle))
-            }
-        val entries = children
-            .filter { it.isFile && isSupportedMedia(it.name) }
-            .map { media ->
-                MediaEntry(
-                    media.name,
-                    Uri.fromFile(media),
-                    mediaMimeType(media.name),
-                    matchSubtitles(media.name, subtitles)
-                )
-            }
-        return entries + children
-            .filter { it.isDirectory && it.canRead() }
-            .flatMap { child ->
-                if (Thread.currentThread().isInterrupted) emptyList()
-                else scanFileDirectoryEntries(child)
-            }
-    }
-
-    private fun scanDocumentDirectory(directory: DocumentFile): List<MediaEntry> {
-        if (Thread.currentThread().isInterrupted) return emptyList()
-        val children = directory.listFiles().sortedBy { it.name.orEmpty().lowercase(Locale.ROOT) }
-        val subtitles = children
-            .filter { it.isFile && isSubtitleFile(it.name) }
-            .mapNotNull { file ->
-                file.name?.let { name -> buildSubtitleFile(name, file.uri) }
-            }
-        val entries = children
-            .filter { it.isFile && isSupportedMedia(it.name) }
-            .mapNotNull { video ->
-                val name = video.name ?: return@mapNotNull null
-                MediaEntry(name, video.uri, mediaMimeType(name), matchSubtitles(name, subtitles))
-            }
-        return entries + children
-            .filter { it.isDirectory }
-            .flatMap { child ->
-                if (Thread.currentThread().isInterrupted) emptyList()
-                else scanDocumentDirectory(child)
-            }
-    }
-
-    private fun isSubtitleFile(name: String?): Boolean =
-        isExtension(name, "vtt") || isExtension(name, "lrc")
-
-    private fun buildSubtitleFile(name: String, uri: Uri): SubtitleFile? {
-        if (isExtension(name, "vtt")) return SubtitleFile(name, uri)
-        if (!isExtension(name, "lrc")) return null
-        return convertLrcSubtitle(name, uri)
-    }
-
-    private fun convertLrcSubtitle(name: String, sourceUri: Uri): SubtitleFile? {
-        val lines = try {
-            contentResolver.openInputStream(sourceUri)?.use { input ->
-                BufferedReader(InputStreamReader(input, StandardCharsets.UTF_8)).readLines()
-            }
-        } catch (_: Exception) {
-            null
-        } ?: return null
-
-        val offsetMs = lines.asSequence()
-            .mapNotNull { line -> lrcOffsetPattern.find(line)?.groupValues?.getOrNull(1)?.toLongOrNull() }
-            .firstOrNull()
-            ?: 0L
-        val cues = lines.asSequence()
-            .flatMap { line ->
-                val timestamps = lrcTimestampPattern.findAll(line).toList()
-                val text = lrcTimestampPattern.replace(line, "").trim()
-                if (timestamps.isEmpty() || text.isEmpty()) {
-                    emptySequence()
-                } else {
-                    timestamps.asSequence().mapNotNull { match ->
-                        parseLrcTimestamp(match.groupValues[1])
-                            ?.let { start -> (start + offsetMs).coerceAtLeast(0L) to text }
-                    }
-                }
-            }
-            .groupBy({ it.first }, { it.second })
-            .toSortedMap()
-            .map { (start, texts) -> start to texts.distinct().joinToString("\n") }
-
-        if (cues.isEmpty()) return null
-        val vtt = buildString {
-            append("WEBVTT\n\n")
-            cues.forEachIndexed { index, (start, text) ->
-                val nextStart = cues.getOrNull(index + 1)?.first
-                val end = (nextStart ?: (start + 5_000L)).coerceAtLeast(start + 500L)
-                append(formatVttTimestamp(start))
-                append(" --> ")
-                append(formatVttTimestamp(end))
-                append('\n')
-                append(text)
-                append("\n\n")
-            }
-        }
-        val cacheDirectory = File(cacheDir, "lrc-subtitles")
-        if (!cacheDirectory.exists() && !cacheDirectory.mkdirs()) return null
-        val cacheName = "lrc-${Integer.toUnsignedString(sourceUri.toString().hashCode())}.vtt"
-        val cacheFile = File(cacheDirectory, cacheName)
-        return try {
-            cacheFile.writeText(vtt, StandardCharsets.UTF_8)
-            SubtitleFile(name, Uri.fromFile(cacheFile))
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun matchSubtitles(videoName: String, subtitles: List<SubtitleFile>): List<SubtitleFile> {
-        val stem = mediaStem(videoName)
-        return subtitles.filter { subtitle ->
-            val subtitleStem = mediaStem(subtitle.name)
-            subtitleStem == stem || subtitleStem.startsWith("$stem.")
-        }.sortedWith(compareBy<SubtitleFile> { !it.isDefaultFor(videoName) }.thenBy { it.name })
-    }
-
     private fun finishScan(entries: List<MediaEntry>) {
         loadedEntries = entries.sortedBy { it.name.lowercase(Locale.ROOT) }
         renderLibrary()
-        applyPlaylist()
-    }
-
-    private fun applyPlaylist() {
-        val player = controller ?: return
-        if (loadedEntries.isEmpty()) return
-        val mediaItems = loadedEntries.map { it.toMediaItem() }
-        val currentUri = player.currentMediaItem?.localConfiguration?.uri?.toString()
-        val currentPosition = player.currentPosition
-        val currentPlaying = player.playWhenReady
-        val savedUri = controlPrefs.getString(LAST_MEDIA_URI, null)
-        val savedPosition = controlPrefs.getLong(LAST_MEDIA_POSITION, 0L)
-        val savedPlaying = controlPrefs.getBoolean(LAST_MEDIA_PLAYING, false)
-        val resumeUri = currentUri ?: savedUri
-        val resumeIndex = resumeUri?.let { uri ->
-            mediaItems.indexOfFirst { it.localConfiguration?.uri?.toString() == uri }
-        } ?: -1
-        val resumePosition = if (currentUri != null) currentPosition else savedPosition
-        val resumePlaying = if (currentUri != null) currentPlaying else savedPlaying
-
-        player.setMediaItems(mediaItems, true)
-        player.prepare()
-        if (resumeIndex >= 0) {
-            player.seekTo(resumeIndex, resumePosition.coerceAtLeast(0L))
-            player.playWhenReady = resumePlaying
-        }
+        playbackCoordinator.applyPlaylist(loadedEntries)
     }
 
     private fun renderLibrary() {
@@ -1157,7 +960,7 @@ class MainActivity : Activity() {
             isClickable = true
             isFocusable = true
             contentDescription = "${entry.name}，播放"
-            setOnClickListener { playEntry(index) }
+            setOnClickListener { playbackCoordinator.playEntry(index) }
         }
         if (entry.isVideo) {
             val thumbnail = ImageView(this).apply {
@@ -1276,11 +1079,6 @@ class MainActivity : Activity() {
         return scaled
     }
 
-    private fun playEntry(index: Int) {
-        controller?.seekToDefaultPosition(index)
-        controller?.play()
-    }
-
     private fun showTimerMenu(anchor: android.view.View) {
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1364,7 +1162,7 @@ class MainActivity : Activity() {
     private fun updatePlaybackSpeedUi(speed: Float) {
         if (speedBoostActive) return
         playbackSpeed = speed.takeIf { it.isFinite() && it > 0f } ?: 1f
-        controlPrefs.edit().putFloat("speed", playbackSpeed).apply()
+        playbackControlStore.saveSpeed(playbackSpeed)
     }
 
     private fun beginSpeedBoost() {
@@ -1535,13 +1333,6 @@ class MainActivity : Activity() {
                 subtitleSizeSp = (12 + sizeSeek.progress).toFloat()
                 subtitleBackgroundAlpha = alphaSeek.progress
                 subtitleBottomDp = 8 + bottomSeek.progress
-                getSharedPreferences("subtitle_preferences", MODE_PRIVATE).edit()
-                    .putBoolean("overlay_enabled", subtitleOverlayEnabled)
-                    .putFloat("subtitle_size", subtitleSizeSp)
-                    .putInt("subtitle_color", subtitleColor)
-                    .putInt("subtitle_background_alpha", subtitleBackgroundAlpha)
-                    .putInt("subtitle_bottom", subtitleBottomDp)
-                    .apply()
                 applyPlayerSubtitleStyle()
                 sendSubtitleSettings()
             }
@@ -1614,7 +1405,6 @@ class MainActivity : Activity() {
 
     private fun setGain(db: Int) {
         gainDb = db.coerceIn(0, 12)
-        controlPrefs.edit().putInt("gain_db", gainDb).apply()
         startService(Intent(this, PlaybackService::class.java).apply {
             action = PlaybackService.ACTION_SET_GAIN
             putExtra(PlaybackService.EXTRA_GAIN_DB, gainDb)
@@ -1626,7 +1416,7 @@ class MainActivity : Activity() {
     private fun setResizeMode(mode: Int) {
         currentResizeMode = mode
         playerView?.resizeMode = mode
-        controlPrefs.edit().putInt("resize_mode", mode).apply()
+        playbackControlStore.saveResizeMode(mode)
     }
 
     private fun speedLabel(speed: Float): String =
@@ -1794,23 +1584,19 @@ class MainActivity : Activity() {
     }
 
     private fun persistControlSettings() {
-        controlPrefs.edit()
-            .putFloat("volume", lastVolume)
-            .putBoolean("muted", isMuted)
-            .putFloat("speed", playbackSpeed)
-            .putInt("gain_db", gainDb)
-            .apply()
+        playbackControlStore.save(
+            PlaybackControlSettings(
+                volume = lastVolume,
+                muted = isMuted,
+                speed = playbackSpeed,
+                gainDb = gainDb,
+                resizeMode = currentResizeMode
+            )
+        )
     }
 
     private fun setTimer(minutes: Int) {
         val safeMinutes = minutes.coerceIn(0, MAX_TIMER_MINUTES)
-        getSharedPreferences(TIMER_PREFS, MODE_PRIVATE).edit().apply {
-            if (safeMinutes == 0) {
-                remove(TIMER_DEADLINE)
-            } else {
-                putLong(TIMER_DEADLINE, System.currentTimeMillis() + safeMinutes * 60_000L)
-            }
-        }.apply()
         startService(Intent(this, PlaybackService::class.java).apply {
             action = PlaybackService.ACTION_SET_TIMER
             putExtra(PlaybackService.EXTRA_MINUTES, safeMinutes)
@@ -1893,7 +1679,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        savePlaybackPosition()
+        playbackCoordinator.savePosition()
         mainHandler.removeCallbacks(progressTicker)
         playerView?.keepScreenOn = false
         volumePopup?.dismiss()
@@ -1917,7 +1703,7 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
-        savePlaybackPosition()
+        playbackCoordinator.savePosition()
         isActivityStarted = false
         updateScreenAwakeState()
         setAppVisible(false)
@@ -1926,16 +1712,6 @@ class MainActivity : Activity() {
 
     private fun updateScreenAwakeState() {
         playerView?.keepScreenOn = isActivityStarted && controller?.isPlaying == true
-    }
-
-    private fun savePlaybackPosition() {
-        val player = controller ?: return
-        val uri = player.currentMediaItem?.localConfiguration?.uri?.toString() ?: return
-        controlPrefs.edit()
-            .putString(LAST_MEDIA_URI, uri)
-            .putLong(LAST_MEDIA_POSITION, player.currentPosition.coerceAtLeast(0L))
-            .putBoolean(LAST_MEDIA_PLAYING, player.playWhenReady)
-            .apply()
     }
 
     private fun statefulBackground(
@@ -1998,18 +1774,6 @@ class MainActivity : Activity() {
             ).apply { marginStart = dp(6) }
             setOnClickListener(action)
         }
-
-    private fun isExtension(name: String?, extension: String): Boolean =
-        name?.substringAfterLast('.', "")?.equals(extension, ignoreCase = true) == true
-
-    private fun isSupportedMedia(name: String?): Boolean =
-        listOf("mp4", "mp3", "wav").any { isExtension(name, it) }
-
-    private fun mediaMimeType(name: String): String = when {
-        isExtension(name, "mp3") -> MimeTypes.AUDIO_MPEG
-        isExtension(name, "wav") -> MimeTypes.AUDIO_WAV
-        else -> MimeTypes.VIDEO_MP4
-    }
 
     private fun formatTime(milliseconds: Long): String {
         if (milliseconds < 0) return "--:--"
@@ -2335,8 +2099,7 @@ class MainActivity : Activity() {
     }
 
     private fun timerRemainingMs(): Long {
-        val deadline = getSharedPreferences(TIMER_PREFS, MODE_PRIVATE)
-            .getLong(TIMER_DEADLINE, 0L)
+        val deadline = sleepTimerStore.deadlineMs()
         return (deadline - System.currentTimeMillis()).coerceAtLeast(0L)
     }
 
@@ -2363,37 +2126,4 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private data class SubtitleFile(val name: String, val uri: Uri) {
-        fun isDefaultFor(videoName: String): Boolean = isDefaultSubtitle(videoName, name)
-    }
-
-    private data class MediaEntry(
-        val name: String,
-        val uri: Uri,
-        val mimeType: String,
-        val subtitles: List<SubtitleFile>
-    ) {
-        val isVideo: Boolean
-            get() = mimeType == MimeTypes.VIDEO_MP4
-
-        fun toMediaItem(): MediaItem {
-            val subtitleConfigurations = subtitles.map { subtitle ->
-                val suffix = subtitleSuffix(name, subtitle.name)
-                MediaItem.SubtitleConfiguration.Builder(subtitle.uri)
-                    .setMimeType(MimeTypes.TEXT_VTT)
-                    .setLanguage(suffix.takeIf { it.length in 2..3 })
-                    .setLabel(if (suffix.isEmpty()) "自动字幕" else suffix)
-                    .setSelectionFlags(
-                        if (isDefaultSubtitle(name, subtitle.name)) C.SELECTION_FLAG_DEFAULT else 0
-                    )
-                    .build()
-            }
-            return MediaItem.Builder()
-                .setUri(uri)
-                .setMimeType(mimeType)
-                .setMediaMetadata(MediaMetadata.Builder().setTitle(name).build())
-                .setSubtitleConfigurations(subtitleConfigurations)
-                .build()
-        }
-    }
 }
