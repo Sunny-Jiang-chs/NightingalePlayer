@@ -30,6 +30,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewConfiguration
 import android.view.accessibility.AccessibilityNodeInfo
 import android.util.TypedValue
 import android.window.OnBackInvokedDispatcher
@@ -66,12 +67,16 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.google.common.util.concurrent.ListenableFuture
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStreamReader
+import java.nio.charset.StandardCharsets
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 
 private fun mediaStem(name: String): String =
     name.substringBeforeLast('.', name).lowercase(Locale.ROOT)
@@ -101,6 +106,38 @@ private fun isDefaultSubtitle(videoName: String, subtitleName: String): Boolean 
     val subtitleStem = mediaStem(subtitleName)
     val extension = mediaExtension(videoName)
     return subtitleStem == videoStem || subtitleStem == "$videoStem.$extension"
+}
+
+private val lrcTimestampPattern = Regex("\\[(\\d{1,3}:\\d{2}(?::\\d{2})?(?:[.:]\\d{1,3})?)\\]")
+private val lrcOffsetPattern = Regex("^\\[offset:([-+]?\\d+)\\]", RegexOption.IGNORE_CASE)
+
+private fun parseLrcTimestamp(timestamp: String): Long? {
+    val parts = timestamp.split(':')
+    if (parts.size !in 2..3) return null
+    val secondParts = parts.last().split('.', limit = 2)
+    val seconds = secondParts[0].toLongOrNull() ?: return null
+    val fraction = secondParts.getOrNull(1)
+        ?.padEnd(3, '0')
+        ?.take(3)
+        ?.toLongOrNull()
+        ?: 0L
+    return if (parts.size == 2) {
+        val minutes = parts[0].toLongOrNull() ?: return null
+        minutes * 60_000L + seconds * 1_000L + fraction
+    } else {
+        val hours = parts[0].toLongOrNull() ?: return null
+        val minutes = parts[1].toLongOrNull() ?: return null
+        hours * 3_600_000L + minutes * 60_000L + seconds * 1_000L + fraction
+    }
+}
+
+private fun formatVttTimestamp(milliseconds: Long): String {
+    val safe = milliseconds.coerceAtLeast(0L)
+    val hours = safe / 3_600_000L
+    val minutes = (safe % 3_600_000L) / 60_000L
+    val seconds = (safe % 60_000L) / 1_000L
+    val millis = safe % 1_000L
+    return "%02d:%02d:%02d.%03d".format(Locale.ROOT, hours, minutes, seconds, millis)
 }
 
 private class VerticalVolumeSlider(
@@ -213,6 +250,7 @@ private class VerticalVolumeSlider(
 class MainActivity : Activity() {
     companion object {
         private const val LONG_PRESS_SPEED_BOOST_MS = 450L
+        private const val VERTICAL_GESTURE_SENSITIVITY = 1f / 3f
         private const val REQUEST_TREE = 1001
         private const val REQUEST_NOTIFICATIONS = 1002
         private const val REQUEST_STORAGE = 1003
@@ -227,7 +265,8 @@ class MainActivity : Activity() {
         private const val MAX_TIMER_MINUTES = 24 * 60
     }
 
-    private val ioExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val scanExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val thumbnailExecutor: ExecutorService = Executors.newFixedThreadPool(2)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
@@ -257,11 +296,19 @@ class MainActivity : Activity() {
     private var subtitleBottomDp = 42
     private var isFullscreen = false
     private var waitingForAllFilesAccess = false
+    private var isActivityStarted = false
     private var scanSequence = 0
+    private var scanFuture: Future<*>? = null
+    private var thumbnailGeneration = 0
+    private val thumbnailFutures = mutableListOf<Future<*>>()
     private var isSeeking = false
     private var scrubGestureEligible = false
     private var scrubGestureCaptured = false
     private var touchGestureEligible = false
+    private var doubleTapGestureCaptured = false
+    private var lastVideoTapUpTime = 0L
+    private var lastVideoTapX = 0f
+    private var lastVideoTapY = 0f
     private var verticalGestureCaptured = false
     private var verticalGestureSide = 0
     private var verticalGestureStartValue = 0f
@@ -492,6 +539,10 @@ class MainActivity : Activity() {
                         updatePlaybackSpeedUi(playbackParameters.speed)
                     }
 
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        updateScreenAwakeState()
+                    }
+
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                         Toast.makeText(
                             this@MainActivity,
@@ -500,6 +551,7 @@ class MainActivity : Activity() {
                         ).show()
                     }
                 })
+                updateScreenAwakeState()
                 controller?.setPlaybackSpeed(playbackSpeed)
                 if (loadedEntries.isNotEmpty()) applyPlaylist()
             } catch (error: Exception) {
@@ -586,7 +638,7 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(4), dp(16), 0)
         }
         val pathView = TextView(this).apply {
-            setTextColor(Color.DKGRAY)
+            setTextColor(Color.rgb(232, 237, 243))
             textSize = 13f
             setPadding(0, 0, 0, dp(6))
         }
@@ -625,7 +677,7 @@ class MainActivity : Activity() {
             val directories = children.filter { it.isDirectory }
             val files = children.filter { it.isFile }
             val playableCount = files.count { isSupportedMedia(it.name) }
-            val subtitleCount = files.count { isExtension(it.name, "vtt") }
+            val subtitleCount = files.count { isSubtitleFile(it.name) }
 
             directoryContainer.addView(TextView(this).apply {
                 text = buildString {
@@ -634,7 +686,7 @@ class MainActivity : Activity() {
                     if (subtitleCount > 0) append(" · ${subtitleCount} 个字幕")
                 }
                 textSize = 12f
-                setTextColor(Color.GRAY)
+                setTextColor(Color.rgb(174, 181, 192))
                 setPadding(0, dp(4), 0, dp(8))
             })
 
@@ -643,7 +695,7 @@ class MainActivity : Activity() {
                     text = "子目录"
                     textSize = 13f
                     setTypeface(typeface, android.graphics.Typeface.BOLD)
-                    setTextColor(Color.DKGRAY)
+                    setTextColor(Color.WHITE)
                     setPadding(0, dp(4), 0, dp(2))
                 })
                 directories.forEach { directory ->
@@ -655,6 +707,7 @@ class MainActivity : Activity() {
                         }
                         gravity = Gravity.START or Gravity.CENTER_VERTICAL
                         isAllCaps = false
+                        setTextColor(Color.rgb(232, 237, 243))
                         setOnClickListener {
                             currentDirectory = directory
                             renderDirectory()
@@ -668,7 +721,7 @@ class MainActivity : Activity() {
                     text = "当前目录内容"
                     textSize = 13f
                     setTypeface(typeface, android.graphics.Typeface.BOLD)
-                    setTextColor(Color.DKGRAY)
+                    setTextColor(Color.WHITE)
                     setPadding(0, dp(10), 0, dp(2))
                 })
                 val previewLimit = 40
@@ -676,23 +729,24 @@ class MainActivity : Activity() {
                     val label = when {
                         isExtension(file.name, "mp4") -> "[视频]"
                         isExtension(file.name, "mp3") || isExtension(file.name, "wav") -> "[音频]"
-                        isExtension(file.name, "vtt") -> "[字幕]"
+                        isSubtitleFile(file.name) -> "[字幕]"
                         else -> "[文件]"
                     }
                     directoryContainer.addView(TextView(this).apply {
                         text = "$label ${file.name}"
                         textSize = 13f
-                        setTextColor(Color.DKGRAY)
+                        setTextColor(Color.rgb(232, 237, 243))
                         maxLines = 1
                         ellipsize = TextUtils.TruncateAt.MIDDLE
-                        setPadding(dp(8), dp(5), 0, dp(5))
+                        setPadding(dp(8), dp(6), dp(8), dp(6))
+                        setBackgroundColor(Color.rgb(27, 33, 40))
                     })
                 }
                 if (files.size > previewLimit) {
                     directoryContainer.addView(TextView(this).apply {
                         text = "… 还有 ${files.size - previewLimit} 个文件未显示"
                         textSize = 12f
-                        setTextColor(Color.GRAY)
+                        setTextColor(Color.rgb(174, 181, 192))
                         setPadding(dp(8), dp(4), 0, dp(8))
                     })
                 }
@@ -702,7 +756,7 @@ class MainActivity : Activity() {
                 directoryContainer.addView(TextView(this).apply {
                     text = "此目录为空或没有可访问的内容"
                     textSize = 13f
-                    setTextColor(Color.GRAY)
+                    setTextColor(Color.rgb(174, 181, 192))
                     setPadding(0, dp(16), 0, dp(16))
                 })
             }
@@ -744,7 +798,7 @@ class MainActivity : Activity() {
 
     private fun scanDocumentTree(uri: Uri) {
         val requestId = beginScan()
-        ioExecutor.execute {
+        scanFuture = scanExecutor.submit {
             val entries = try {
                 val root = DocumentFile.fromTreeUri(this, uri)
                 root?.let { scanDocumentDirectory(it) }.orEmpty()
@@ -759,7 +813,7 @@ class MainActivity : Activity() {
 
     private fun scanFileDirectory(directory: File) {
         val requestId = beginScan()
-        ioExecutor.execute {
+        scanFuture = scanExecutor.submit {
             val entries = try {
                 scanFileDirectoryEntries(directory)
             } catch (_: RuntimeException) {
@@ -772,6 +826,12 @@ class MainActivity : Activity() {
     }
 
     private fun beginScan(): Int {
+        scanFuture?.cancel(true)
+        thumbnailGeneration += 1
+        synchronized(thumbnailFutures) {
+            thumbnailFutures.forEach { it.cancel(true) }
+            thumbnailFutures.clear()
+        }
         val requestId = ++scanSequence
         showLibraryLoading()
         return requestId
@@ -800,14 +860,17 @@ class MainActivity : Activity() {
     }
 
     private fun scanFileDirectoryEntries(directory: File): List<MediaEntry> {
+        if (Thread.currentThread().isInterrupted) return emptyList()
         val children = try {
             directory.listFiles()?.sortedBy { it.name.lowercase(Locale.ROOT) }.orEmpty()
         } catch (_: SecurityException) {
             emptyList()
         }
         val subtitles = children
-            .filter { it.isFile && isExtension(it.name, "vtt") }
-            .map { SubtitleFile(it.name, Uri.fromFile(it)) }
+            .filter { it.isFile && isSubtitleFile(it.name) }
+            .mapNotNull { subtitle ->
+                buildSubtitleFile(subtitle.name, Uri.fromFile(subtitle))
+            }
         val entries = children
             .filter { it.isFile && isSupportedMedia(it.name) }
             .map { media ->
@@ -820,14 +883,20 @@ class MainActivity : Activity() {
             }
         return entries + children
             .filter { it.isDirectory && it.canRead() }
-            .flatMap { scanFileDirectoryEntries(it) }
+            .flatMap { child ->
+                if (Thread.currentThread().isInterrupted) emptyList()
+                else scanFileDirectoryEntries(child)
+            }
     }
 
     private fun scanDocumentDirectory(directory: DocumentFile): List<MediaEntry> {
+        if (Thread.currentThread().isInterrupted) return emptyList()
         val children = directory.listFiles().sortedBy { it.name.orEmpty().lowercase(Locale.ROOT) }
         val subtitles = children
-            .filter { it.isFile && isExtension(it.name, "vtt") }
-            .mapNotNull { file -> file.name?.let { SubtitleFile(it, file.uri) } }
+            .filter { it.isFile && isSubtitleFile(it.name) }
+            .mapNotNull { file ->
+                file.name?.let { name -> buildSubtitleFile(name, file.uri) }
+            }
         val entries = children
             .filter { it.isFile && isSupportedMedia(it.name) }
             .mapNotNull { video ->
@@ -836,7 +905,75 @@ class MainActivity : Activity() {
             }
         return entries + children
             .filter { it.isDirectory }
-            .flatMap { scanDocumentDirectory(it) }
+            .flatMap { child ->
+                if (Thread.currentThread().isInterrupted) emptyList()
+                else scanDocumentDirectory(child)
+            }
+    }
+
+    private fun isSubtitleFile(name: String?): Boolean =
+        isExtension(name, "vtt") || isExtension(name, "lrc")
+
+    private fun buildSubtitleFile(name: String, uri: Uri): SubtitleFile? {
+        if (isExtension(name, "vtt")) return SubtitleFile(name, uri)
+        if (!isExtension(name, "lrc")) return null
+        return convertLrcSubtitle(name, uri)
+    }
+
+    private fun convertLrcSubtitle(name: String, sourceUri: Uri): SubtitleFile? {
+        val lines = try {
+            contentResolver.openInputStream(sourceUri)?.use { input ->
+                BufferedReader(InputStreamReader(input, StandardCharsets.UTF_8)).readLines()
+            }
+        } catch (_: Exception) {
+            null
+        } ?: return null
+
+        val offsetMs = lines.asSequence()
+            .mapNotNull { line -> lrcOffsetPattern.find(line)?.groupValues?.getOrNull(1)?.toLongOrNull() }
+            .firstOrNull()
+            ?: 0L
+        val cues = lines.asSequence()
+            .flatMap { line ->
+                val timestamps = lrcTimestampPattern.findAll(line).toList()
+                val text = lrcTimestampPattern.replace(line, "").trim()
+                if (timestamps.isEmpty() || text.isEmpty()) {
+                    emptySequence()
+                } else {
+                    timestamps.asSequence().mapNotNull { match ->
+                        parseLrcTimestamp(match.groupValues[1])
+                            ?.let { start -> (start + offsetMs).coerceAtLeast(0L) to text }
+                    }
+                }
+            }
+            .groupBy({ it.first }, { it.second })
+            .toSortedMap()
+            .map { (start, texts) -> start to texts.distinct().joinToString("\n") }
+
+        if (cues.isEmpty()) return null
+        val vtt = buildString {
+            append("WEBVTT\n\n")
+            cues.forEachIndexed { index, (start, text) ->
+                val nextStart = cues.getOrNull(index + 1)?.first
+                val end = (nextStart ?: (start + 5_000L)).coerceAtLeast(start + 500L)
+                append(formatVttTimestamp(start))
+                append(" --> ")
+                append(formatVttTimestamp(end))
+                append('\n')
+                append(text)
+                append("\n\n")
+            }
+        }
+        val cacheDirectory = File(cacheDir, "lrc-subtitles")
+        if (!cacheDirectory.exists() && !cacheDirectory.mkdirs()) return null
+        val cacheName = "lrc-${Integer.toUnsignedString(sourceUri.toString().hashCode())}.vtt"
+        val cacheFile = File(cacheDirectory, cacheName)
+        return try {
+            cacheFile.writeText(vtt, StandardCharsets.UTF_8)
+            SubtitleFile(name, Uri.fromFile(cacheFile))
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun matchSubtitles(videoName: String, subtitles: List<SubtitleFile>): List<SubtitleFile> {
@@ -1078,8 +1215,9 @@ class MainActivity : Activity() {
 
     private fun loadVideoThumbnail(entry: MediaEntry, target: ImageView) {
         val uriKey = entry.uri.toString()
+        val generation = thumbnailGeneration
         target.tag = uriKey
-        ioExecutor.execute {
+        val future = thumbnailExecutor.submit {
             var thumbnail: Bitmap? = null
             val retriever = MediaMetadataRetriever()
             try {
@@ -1101,9 +1239,9 @@ class MainActivity : Activity() {
                     // Ignore release failures from malformed media.
                 }
             }
-            val result = thumbnail ?: return@execute
+            val result = thumbnail ?: return@submit
             runOnUiThread {
-                if (!isDestroyed && target.tag == uriKey) {
+                if (!isDestroyed && generation == thumbnailGeneration && target.tag == uriKey) {
                     target.scaleType = ImageView.ScaleType.CENTER_CROP
                     target.clearColorFilter()
                     target.setImageBitmap(result)
@@ -1111,6 +1249,10 @@ class MainActivity : Activity() {
                     result.recycle()
                 }
             }
+        }
+        synchronized(thumbnailFutures) {
+            thumbnailFutures += future
+            thumbnailFutures.removeAll { it.isDone || it.isCancelled }
         }
     }
 
@@ -1753,8 +1895,15 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         savePlaybackPosition()
         mainHandler.removeCallbacks(progressTicker)
+        playerView?.keepScreenOn = false
         volumePopup?.dismiss()
-        ioExecutor.shutdownNow()
+        scanFuture?.cancel(true)
+        synchronized(thumbnailFutures) {
+            thumbnailFutures.forEach { it.cancel(true) }
+            thumbnailFutures.clear()
+        }
+        scanExecutor.shutdownNow()
+        thumbnailExecutor.shutdownNow()
         controller?.release()
         controllerFuture?.cancel(true)
         super.onDestroy()
@@ -1762,13 +1911,21 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        isActivityStarted = true
+        updateScreenAwakeState()
         setAppVisible(true)
     }
 
     override fun onStop() {
         savePlaybackPosition()
+        isActivityStarted = false
+        updateScreenAwakeState()
         setAppVisible(false)
         super.onStop()
+    }
+
+    private fun updateScreenAwakeState() {
+        playerView?.keepScreenOn = isActivityStarted && controller?.isPlaying == true
     }
 
     private fun savePlaybackPosition() {
@@ -1875,25 +2032,39 @@ class MainActivity : Activity() {
                 touchGestureActive = true
                 verticalGestureCaptured = false
                 verticalGestureSide = 0
+                doubleTapGestureCaptured = false
+                val doubleTapSlop = ViewConfiguration.get(this).scaledDoubleTapSlop.toFloat()
+                val timeSinceLastTap = event.eventTime - lastVideoTapUpTime
+                val isSecondTap = lastVideoTapUpTime > 0L &&
+                    timeSinceLastTap in 0L..ViewConfiguration.getDoubleTapTimeout().toLong() &&
+                    abs(event.x - lastVideoTapX) <= doubleTapSlop &&
+                    abs(event.y - lastVideoTapY) <= doubleTapSlop
                 val blockedTouch = isProgressBarTouch(view, event) ||
                     isPlayerControlTouch(view, event)
-                touchGestureEligible = !blockedTouch
+                doubleTapGestureCaptured = isSecondTap && player?.currentMediaItem != null
+                touchGestureEligible = doubleTapGestureCaptured || !blockedTouch
                 scrubGestureEligible = player != null &&
                     player.duration > 0L &&
-                    !blockedTouch
+                    touchGestureEligible
                 scrubGestureCaptured = false
                 scrubStartX = event.x
                 scrubStartY = event.y
                 scrubStartPosition = player?.currentPosition?.coerceAtLeast(0L) ?: 0L
                 scrubTargetPosition = scrubStartPosition
                 scrubDuration = player?.duration?.coerceAtLeast(0L) ?: 0L
-                if (touchGestureEligible && player?.isPlaying == true) {
+                if (touchGestureEligible &&
+                    !doubleTapGestureCaptured &&
+                    player?.isPlaying == true
+                ) {
                     mainHandler.postDelayed(longPressSpeedBoostRunnable, LONG_PRESS_SPEED_BOOST_MS)
                 }
+                if (doubleTapGestureCaptured) return true
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
                 mainHandler.removeCallbacks(longPressSpeedBoostRunnable)
+                doubleTapGestureCaptured = false
+                lastVideoTapUpTime = 0L
                 scrubGestureEligible = false
                 touchGestureEligible = false
                 if (scrubGestureCaptured) {
@@ -1915,6 +2086,12 @@ class MainActivity : Activity() {
                 if (speedBoostActive) return true
                 val deltaX = event.x - scrubStartX
                 val deltaY = event.y - scrubStartY
+                if (doubleTapGestureCaptured) {
+                    val touchSlop = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
+                    if (abs(deltaX) <= touchSlop && abs(deltaY) <= touchSlop) return true
+                    doubleTapGestureCaptured = false
+                    lastVideoTapUpTime = 0L
+                }
                 if (!scrubGestureCaptured) {
                     val horizontal = abs(deltaX) > dp(12) && abs(deltaX) > abs(deltaY) * 1.2f
                     val vertical = abs(deltaY) > dp(12) && abs(deltaY) > abs(deltaX) * 1.2f
@@ -1948,20 +2125,45 @@ class MainActivity : Activity() {
             MotionEvent.ACTION_UP -> {
                 mainHandler.removeCallbacks(longPressSpeedBoostRunnable)
                 touchGestureActive = false
+                if (doubleTapGestureCaptured) {
+                    doubleTapGestureCaptured = false
+                    lastVideoTapUpTime = 0L
+                    scrubGestureEligible = false
+                    touchGestureEligible = false
+                    controller?.let { player ->
+                        if (player.isPlaying) player.pause() else player.play()
+                    }
+                    playerView?.showController()
+                    return true
+                }
                 if (speedBoostActive) {
                     endSpeedBoost()
+                    lastVideoTapUpTime = 0L
                     scrubGestureEligible = false
                     touchGestureEligible = false
                     return true
                 }
                 if (verticalGestureCaptured) {
                     finishVerticalGesture()
+                    lastVideoTapUpTime = 0L
                     scrubGestureEligible = false
                     touchGestureEligible = false
                     return true
                 }
                 val wasScrubbing = scrubGestureCaptured
                 if (wasScrubbing) finishScrub(commit = true)
+                val touchSlop = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
+                val wasTap = touchGestureEligible &&
+                    !wasScrubbing &&
+                    abs(event.x - scrubStartX) <= touchSlop &&
+                    abs(event.y - scrubStartY) <= touchSlop
+                if (wasTap) {
+                    lastVideoTapUpTime = event.eventTime
+                    lastVideoTapX = event.x
+                    lastVideoTapY = event.y
+                } else {
+                    lastVideoTapUpTime = 0L
+                }
                 scrubGestureEligible = false
                 touchGestureEligible = false
                 return wasScrubbing
@@ -1970,6 +2172,8 @@ class MainActivity : Activity() {
             MotionEvent.ACTION_CANCEL -> {
                 mainHandler.removeCallbacks(longPressSpeedBoostRunnable)
                 touchGestureActive = false
+                doubleTapGestureCaptured = false
+                lastVideoTapUpTime = 0L
                 if (speedBoostActive) endSpeedBoost()
                 if (verticalGestureCaptured) finishVerticalGesture()
                 val wasScrubbing = scrubGestureCaptured
@@ -1995,8 +2199,8 @@ class MainActivity : Activity() {
 
     private fun updateVerticalGesture(view: View, event: MotionEvent) {
         if (!verticalGestureCaptured) return
-        val deltaFraction = (scrubStartY - event.y) /
-            view.height.coerceAtLeast(1).toFloat()
+        val deltaFraction = ((scrubStartY - event.y) /
+            view.height.coerceAtLeast(1).toFloat()) * VERTICAL_GESTURE_SENSITIVITY
         val value = (verticalGestureStartValue + deltaFraction).coerceIn(0f, 1f)
         val percent = (value * 100f).roundToInt()
         if (verticalGestureSide < 0) {
