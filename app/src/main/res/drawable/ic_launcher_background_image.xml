@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- The artwork is padded on the adaptive 108dp canvas so the bird and moon fit
+     within the 66dp safe circle. Do not replace this with the unpadded master. -->
 <bitmap xmlns:android="http://schemas.android.com/apk/res/android"
-    android:src="@drawable/nightingale_player_icon"
+    android:src="@drawable/nightingale_player_icon_adaptive"
     android:gravity="fill" />

@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<merge xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Keep the three actions visible instead of moving them into an overflow menu. -->
+    <LinearLayout
+        android:id="@id/exo_bottom_bar"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/exo_styled_bottom_bar_height"
+        android:layout_gravity="bottom"
+        android:layout_marginTop="@dimen/exo_styled_bottom_bar_margin_top"
+        android:background="@color/exo_bottom_bar_background"
+        android:gravity="center_vertical"
+        android:layoutDirection="ltr"
+        android:orientation="horizontal">
+
+        <FrameLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1">
+
+            <LinearLayout
+                android:id="@id/exo_time"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@id/exo_position"
+                    style="@style/ExoStyledControls.TimeText.Position"
+                    android:layout_weight="1"
+                    android:autoSizeMaxTextSize="12sp"
+                    android:autoSizeMinTextSize="9sp"
+                    android:autoSizeStepGranularity="1sp"
+                    android:autoSizeTextType="uniform"
+                    android:maxLines="1"
+                    android:paddingLeft="2dp"
+                    android:paddingRight="2dp"
+                    android:textSize="12sp" />
+
+                <TextView
+                    style="@style/ExoStyledControls.TimeText.Separator"
+                    android:paddingLeft="2dp"
+                    android:paddingRight="2dp"
+                    android:textSize="12sp" />
+
+                <TextView
+                    android:id="@id/exo_duration"
+                    style="@style/ExoStyledControls.TimeText.Duration"
+                    android:layout_weight="1"
+                    android:autoSizeMaxTextSize="12sp"
+                    android:autoSizeMinTextSize="9sp"
+                    android:autoSizeStepGranularity="1sp"
+                    android:autoSizeTextType="uniform"
+                    android:maxLines="1"
+                    android:paddingLeft="2dp"
+                    android:paddingRight="2dp"
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </FrameLayout>
+
+        <LinearLayout
+            android:id="@id/exo_basic_controls"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ImageButton
+                android:id="@id/exo_settings"
+                style="@style/ExoStyledControls.Button.Bottom.Settings"
+                android:layout_marginLeft="0dp"
+                android:layout_marginRight="0dp" />
+
+            <!-- The volume button is inserted immediately before fullscreen. -->
+            <ImageButton
+                android:id="@id/exo_fullscreen"
+                style="@style/ExoStyledControls.Button.Bottom.FullScreen"
+                android:layout_marginLeft="0dp"
+                android:layout_marginRight="0dp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <View
+        android:id="@id/exo_progress_placeholder"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/exo_styled_progress_layout_height"
+        android:layout_gravity="bottom"
+        android:layout_marginBottom="@dimen/exo_styled_progress_margin_bottom" />
+</merge>

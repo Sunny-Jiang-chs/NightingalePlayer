@@ -1,6 +1,12 @@
-# 夜莺播放器
+# 夜莺播放器 · Android
+
+> 共同工作区：[MediaSuite](../README.md) · 共同开发与前端规范：[AGENTS.md](../AGENTS.md)。
 
 面向助眠场景的 Android 本地媒体播放器，支持 MP4、MP3、WAV，外挂 WebVTT 字幕和 LRC 歌词。
+
+名称保持「夜莺播放器 · Nightingale」，使用与 Windows 版一致的月牙与青鸟图标，与媒体制作工具「织声 · Soundweaver」配套。自适应图标和安全区说明见 [品牌资源](assets/branding/README.md)。
+
+当前源码版本由 `app/build.gradle.kts` 定义：`versionName = "0.2.6"`、`versionCode = 9`，最低 Android 8.0（API 26）。内部包名/applicationId `com.myp.sleepplayer`、项目目录 `NightingalePlayer`、已有偏好文件和模拟器媒体目录 `SleepVideoPlayer` 保持兼容，不随对外名称更改。已有 APK 可能来自较早的构建，不能仅凭文件名认定与当前源码一致。
 
 ## 已实现
 
@@ -52,16 +58,18 @@ PlaybackService ──> Media3 player/session
 
 服务命令仍通过现有的 `Intent` action 在 Activity 与 `PlaybackService` 之间传递；偏好 store 只负责持久化，不替代服务命令通道。Activity 通过 `PlaybackControlStore` 保存音量、静音、倍速、增益和画面模式；`PlaybackService` 通过同一 store 在处理增益命令时保存增益。定时和字幕设置由 `PlaybackService` 写入对应 store，Activity 读取这些值用于显示。后续扩展优先将纯字幕时间轴与 cue 查找放入 `media`，将 seek 策略放入 `playback`，UI 只发出操作并显示结果；只有在职责和依赖稳定后再考虑继续拆分手势、设置弹窗或 Service 管理器。当前分层不改变支持的媒体格式、扫描顺序、字幕匹配规则、LRC 转换缓存、播放恢复或现有控制行为。
 
-字幕与定位自检可运行 `gradlew.bat :app:verifySubtitleSupport`，覆盖 LRC offset、多时间戳、VTT cue 起点、重复起点、末尾 cue 时长、WebVTT 输出和最近字幕起点吸附。
+字幕与定位自检覆盖 LRC offset、多时间戳、VTT cue 起点、重复起点、末尾 cue 时长、WebVTT 输出和最近字幕起点吸附；环境与命令见下方“构建与自动检查”。
 
 ## 模拟器调试
 
-环境默认使用 `D:\tools\android-sdk` 和 AVD `northward_api36`。
+环境默认使用 `D:\tools\android-sdk` 和 AVD `northward_api36`，Java 需预先可用。建议只保留一个正在运行的模拟器：安装/启动脚本选择枚举到的最后一个 `emulator-*`，同步脚本选择第一个；它们不保证在多模拟器情况下选择相同设备。
 
 1. 双击 `run_debug.bat`，启动模拟器、构建、安装并打开应用。
 2. 把媒体文件放到 `test-media`。
 3. 双击 `sync_media.bat`，镜像到模拟器的 `/sdcard/Movies/SleepVideoPlayer`。
 4. 应用中点击“选择目录”，授权 `Movies/SleepVideoPlayer`。
+
+`sync_media.bat` 会先上传整个 `test-media` 目录（不限文件扩展名），再把模拟器原目录移入 `/sdcard/Movies/.SleepVideoPlayer-backups/<时间戳>` 并切换到新目录。已存在但为空的 `test-media` 也会把目标替换为空目录；不存在时只创建本机目录并退出。此操作不是增量添加，运行前应确认本机目录内容。
 
 普通目录可以继续使用系统目录选择器。要打开 `.movie` 等点号开头的隐藏目录，点击“选择目录” → “浏览全部目录（含隐藏）”，按系统提示允许“所有文件访问”，再在应用内选择目录。该权限只用于读取用户主动选择的媒体目录。
 
@@ -69,22 +77,38 @@ PlaybackService ──> Media3 player/session
 
 应用中点击“字幕”，打开“退到后台时显示悬浮字幕”，再点击“授权悬浮字幕显示”并允许“显示在其他应用上层”。保存后，播放带 VTT 的媒体并退到后台；只有当前 cue 有文字时才会显示悬浮字幕。字幕设置也会同步作用于前台视频字幕。
 
-`sync_media.bat` 只选择 `emulator-*` 设备，不会写入真机。只安装已有 APK 可使用 `install_debug.bat`。
+`run_debug.bat`、`install_debug.bat` 和 `sync_media.bat` 都只选择 `emulator-*` 设备，不会选中真机。`install_debug.bat` 不编译，也不启动模拟器；它会覆盖安装已有 Debug APK，随后强停并启动应用，可能中断当前播放。三个批处理脚本结束时均会等待按键。完整操作说明见 [调试说明](调试说明.md)。
 
-## 构建
+## 构建与自动检查
+
+需要 JDK 17、Android SDK Platform 36，以及 Gradle Wrapper 使用的构建依赖。以下命令从项目目录执行；本机工具路径如下，迁移到其他机器时按实际安装位置调整。Gradle 首次运行可能下载 Wrapper 和缺失依赖。
 
 ```powershell
+$env:JAVA_HOME = "D:\tools\jdk17\jdk-17.0.20+8"
+$env:ANDROID_HOME = "D:\tools\android-sdk"
+$env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
 $env:GRADLE_USER_HOME = "D:\tools\gradle-user-home"
-.\gradlew.bat assembleDebug
+.\gradlew.bat --console=plain :app:assembleDebug
 ```
 
-APK 输出在 `app\build\outputs\apk\debug\app-debug.apk`。
+APK 输出在 `app\build\outputs\apk\debug\app-debug.apk`。这是只构建入口，不会启动模拟器、安装 APK 或打开应用；会更新项目的 `.gradle` / `build` / `app/build` 和指定的 Gradle 缓存。
+
+使用上述同一环境运行不需要设备的字幕与定位检查：
+
+```powershell
+.\gradlew.bat --console=plain :app:verifySubtitleSupport
+```
+
+它会编译相关测试类并执行 JVM 检查，仍会写构建与依赖缓存；通过不代表播放、手势、后台服务或权限交互已经验收。
 
 构建发布包：
 
 ```powershell
-$env:GRADLE_USER_HOME = "D:\tools\gradle-user-home"
-.\gradlew.bat assembleRelease
+.\gradlew.bat --console=plain :app:assembleRelease
 ```
 
-当前发布构建沿用本机 Android debug 签名，APK 输出在 `app\build\outputs\apk\release\app-release.apk`，可直接安装并覆盖 `run_debug.bat` 安装的版本。正式上架时应替换为专用的私有 release keystore。
+发布构建使用上述同一环境，沿用本机 Android debug 签名，APK 输出在 `app\build\outputs\apk\release\app-release.apk`。使用同一 debug keystore 且版本号不降低时，可以覆盖安装先前的 Debug 版本；换机器或旧 APK 版本不同可能不满足这一条件。构建不会安装或发布 APK。正式上架时应替换为专用的私有 release keystore。
+
+## 数据与交互副作用
+
+应用会在自身私有存储中保存目录授权、播放位置和状态、音量/倍速/增益、画面模式、字幕与定时偏好；LRC 转换后的 WebVTT 写入应用缓存。普通目录通过系统选择器授权，隐藏目录入口会请求“所有文件访问”，悬浮字幕会请求“显示在其他应用上层”。打开媒体会启动播放服务；睡眠定时到期会暂停并停止服务。安装与同步操作会写入模拟器，不能当作只读验证。

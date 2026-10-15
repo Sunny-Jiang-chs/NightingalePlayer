@@ -1479,8 +1479,9 @@ class MainActivity : Activity() {
         isFullscreen = fullscreen
         val root = rootLayout ?: return
         val video = playerView ?: return
+        video.setFullscreenButtonState(fullscreen)
+        volumePopup?.dismiss()
         if (fullscreen) {
-            volumePopup?.dismiss()
             for (index in 0 until root.childCount) {
                 val child = root.getChildAt(index)
                 if (child !== video) child.visibility = View.GONE
@@ -1582,20 +1583,20 @@ class MainActivity : Activity() {
     }
 
     private fun attachSpeakerButtonToPlayerControls() {
-        val settingsButton = playerView?.findViewById<View>(
-            androidx.media3.ui.R.id.exo_settings
+        val fullscreenButton = playerView?.findViewById<View>(
+            androidx.media3.ui.R.id.exo_fullscreen
         ) ?: return
-        val controls = settingsButton.parent as? ViewGroup ?: return
+        val controls = fullscreenButton.parent as? ViewGroup ?: return
         val speaker = speakerButton ?: return
         if (speaker.parent === controls) return
 
         (speaker.parent as? ViewGroup)?.removeView(speaker)
-        val index = controls.indexOfChild(settingsButton)
+        val index = controls.indexOfChild(fullscreenButton)
         if (index < 0) return
         controls.addView(
             speaker,
             index,
-            ViewGroup.LayoutParams(settingsButton.layoutParams)
+            ViewGroup.LayoutParams(fullscreenButton.layoutParams)
         )
     }
 

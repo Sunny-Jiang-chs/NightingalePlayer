@@ -1,0 +1,10 @@
+Use case: logo-brand.
+Create ONE finished premium 1024 x 1024 raster launcher icon for Nightingale, a calm media player. This is the nocturnal player in a four-app family: nightingale bird, woven sound ribbons, golden oriole bird, collected picture cards. Generate ONLY the nightingale icon, never the family sheet.
+
+Art direction shared by the family: a precise, sculptural cut-paper emblem, three broad overlapping matte paper planes, restrained silky gradients, almost invisible paper grain, crisp graceful contours, very shallow soft self-shadow, sophisticated contemporary desktop software identity. Simple and immediately legible at 48 pixels. No scene, no ground plane, no realistic objects, no glossy plastic or heavy 3D bevel.
+
+Full-bleed opaque midnight navy background, approximately #101D35, with a very subtle cool central lift. A single elegant turquoise nightingale faces right, calm compact upright posture, gently closed eye as one tiny ivory curve, short coral beak, two restrained tapering tail feathers. The broad foreground wing has a clearly cut-out small right-pointing navy play triangle as negative space. Bird palette: pale aqua highlights, saturated turquoise body, deep teal lower wing. Behind the upper-left of the bird is a broad, unmistakable warm ivory crescent moon with a generous dark opening. One bird and one moon form ONE unified emblem; wing is the visual focus. The style is elegant, not childish, not an owl, not realistic feathers.
+
+Centered optically, bird and moon together contained within the central 66% of the square, generous quiet margin on every side; nothing outside approximately x=18..82%, y=17..83%. The moon must remain a clearly readable crescent at small size. All shapes fully visible. Flat square artwork fills all four edges; do not draw an app tile or pre-round the outer corners.
+
+No text, no letters, no watermark, no border, no extra birds, no stars, no music notes, no sparkles, no decorative rays, no mockup, no labels, no contact sheet. Deliver only this one polished square icon.
