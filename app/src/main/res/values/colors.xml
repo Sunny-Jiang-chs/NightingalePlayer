@@ -1,4 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="launcher_background">#08161D</color>
+    <color name="player_background">#0D0F12</color>
+    <color name="player_surface">#181E25</color>
+    <color name="player_surface_raised">#222C35</color>
+    <color name="player_border">#35434D</color>
+    <color name="player_text">#E7EEF3</color>
+    <color name="player_text_muted">#A4B1BE</color>
+    <color name="player_accent">#80DCC8</color>
+    <color name="player_selected">#213F3A</color>
+    <color name="player_danger">#FFB4AB</color>
 </resources>

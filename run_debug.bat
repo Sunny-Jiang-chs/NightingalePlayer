@@ -34,12 +34,18 @@ for /l %%N in (1,1,90) do (
 echo Android boot timed out.
 goto fail
 :build
+echo Building source from %CD%
 call "%~dp0gradlew.bat" --console=plain assembleDebug
 if errorlevel 1 goto fail
-"%ADB%" -s "!SERIAL!" install -r "%~dp0app\build\outputs\apk\debug\app-debug.apk"
-if errorlevel 1 goto fail
+if not exist "%~dp0tmp" mkdir "%~dp0tmp"
+echo Installing new APK on !SERIAL! ...
+"%ADB%" -s "!SERIAL!" install -r "%~dp0app\build\outputs\apk\debug\app-debug.apk" > "%~dp0tmp\run-debug-install.log" 2>&1
+if errorlevel 1 goto install_failed
+type "%~dp0tmp\run-debug-install.log"
 "%ADB%" -s "!SERIAL!" shell am force-stop com.myp.sleepplayer
-"%ADB%" -s "!SERIAL!" shell monkey -p com.myp.sleepplayer 1
+"%ADB%" -s "!SERIAL!" shell am start -n com.myp.sleepplayer/.MainActivity
+if errorlevel 1 goto fail
+"%ADB%" -s "!SERIAL!" shell dumpsys package com.myp.sleepplayer | findstr "versionCode versionName lastUpdateTime"
 echo.
 echo App started on !SERIAL!.
 echo Put videos in the shared folder and choose it in the app: /sdcard/Movies/SleepVideoPlayer
@@ -53,6 +59,12 @@ for /f "tokens=1,2" %%A in ('"%ADB%" devices 2^>nul') do (
 exit /b 0
 :missing
 echo Android SDK tools were not found under %SDK_ROOT%.
+goto fail
+:install_failed
+type "%~dp0tmp\run-debug-install.log"
+echo UPDATE FAILED. The old installed app has NOT been updated.
+echo Check available device storage below. Full error: tmp\run-debug-install.log
+"%ADB%" -s "!SERIAL!" shell df -h /data
 :fail
 pause
 exit /b 1

@@ -13,31 +13,48 @@ internal class PlaybackCoordinator(private val stateStore: PlaybackStateStore) {
 
     fun applyPlaylist(entries: List<MediaEntry>) {
         val player = player ?: return
-        if (entries.isEmpty()) return
+        if (entries.isEmpty()) {
+            player.pause()
+            player.clearMediaItems()
+            return
+        }
 
         val mediaItems = entries.map(MediaItemMapper::map)
+        // Reopening the page must not interrupt an already playing background queue.
+        if (player.mediaItemCount == mediaItems.size &&
+            mediaItems.indices.all { player.getMediaItemAt(it) == mediaItems[it] }
+        ) return
         val currentUri = player.currentMediaItem?.localConfiguration?.uri?.toString()
-        val currentPosition = player.currentPosition
-        val currentPlaying = player.playWhenReady
-        val savedState = stateStore.read()
-        val resumeUri = currentUri ?: savedState.mediaUri
-        val resumeIndex = resumeUri?.let { uri ->
-            mediaItems.indexOfFirst { it.localConfiguration?.uri?.toString() == uri }
-        } ?: -1
-        val resumePosition = if (currentUri != null) currentPosition else savedState.positionMs
-        val resumePlaying = if (currentUri != null) currentPlaying else savedState.playWhenReady
-
-        player.setMediaItems(mediaItems, true)
+        val resume = resolvePlaylistResume(
+            uris = entries.map { it.uri.toString() },
+            currentUri = currentUri,
+            currentPositionMs = player.currentPosition,
+            currentPlaying = player.playWhenReady,
+            savedState = stateStore.read()
+        )
+        player.setMediaItems(mediaItems, resume.index, resume.positionMs)
+        player.playWhenReady = resume.playWhenReady
         player.prepare()
-        if (resumeIndex >= 0) {
-            player.seekTo(resumeIndex, resumePosition.coerceAtLeast(0L))
-            player.playWhenReady = resumePlaying
-        }
     }
 
     fun playEntry(index: Int) {
-        player?.seekToDefaultPosition(index)
-        player?.play()
+        val player = player ?: return
+        if (index !in 0 until player.mediaItemCount) return
+        player.seekToDefaultPosition(index)
+        if (player.playbackState == Player.STATE_IDLE) player.prepare()
+        player.play()
+    }
+
+    fun togglePlayback() {
+        val player = player ?: return
+        if (player.mediaItemCount == 0) return
+        if (player.playWhenReady && player.playbackState != Player.STATE_ENDED) {
+            player.pause()
+        } else {
+            if (player.playbackState == Player.STATE_ENDED) player.seekToDefaultPosition()
+            if (player.playbackState == Player.STATE_IDLE) player.prepare()
+            player.play()
+        }
     }
 
     fun savePosition() {

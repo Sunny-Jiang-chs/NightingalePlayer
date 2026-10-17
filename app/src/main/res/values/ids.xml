@@ -1,0 +1,5 @@
+<resources>
+    <item name="queue_move_up" type="id" />
+    <item name="queue_move_down" type="id" />
+    <item name="queue_remove" type="id" />
+</resources>

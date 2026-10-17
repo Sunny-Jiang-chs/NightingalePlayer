@@ -11,8 +11,8 @@ android {
         applicationId = "com.myp.sleepplayer"
         minSdk = 26
         targetSdk = 36
-        versionCode = 9
-        versionName = "0.2.6"
+        versionCode = 10
+        versionName = "0.3.0"
     }
 
     buildTypes {
@@ -41,6 +41,7 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.documentfile:documentfile:1.0.1")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("androidx.media3:media3-exoplayer:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
     implementation("androidx.media3:media3-session:1.5.1")
@@ -53,4 +54,13 @@ tasks.register<JavaExec>("verifySubtitleSupport") {
         layout.buildDirectory.dir("tmp/kotlin-classes/debug")
     ) + configurations.getByName("debugUnitTestRuntimeClasspath")
     mainClass.set("com.myp.sleepplayer.media.SubtitleSupportTest")
+}
+
+tasks.register<JavaExec>("verifyPlaybackQueue") {
+    dependsOn("compileDebugUnitTestKotlin")
+    classpath = files(
+        layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
+        layout.buildDirectory.dir("tmp/kotlin-classes/debug")
+    ) + configurations.getByName("debugUnitTestRuntimeClasspath")
+    mainClass.set("com.myp.sleepplayer.playback.PlaybackQueueTest")
 }

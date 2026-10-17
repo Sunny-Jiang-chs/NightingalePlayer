@@ -21,6 +21,8 @@ import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.myp.sleepplayer.playback.PlaybackControlStore
 import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
+import com.myp.sleepplayer.playback.PlaybackMode
+import com.myp.sleepplayer.playback.PlaybackQueueStore
 import com.myp.sleepplayer.playback.SleepTimerStore
 import com.myp.sleepplayer.playback.SubtitlePreferencesStore
 import com.myp.sleepplayer.playback.SubtitleSettings
@@ -65,6 +67,9 @@ class PlaybackService : MediaSessionService() {
     private val playbackControlStore by lazy {
         PlaybackControlStore(getSharedPreferences(PlaybackPreferenceFiles.CONTROLS, MODE_PRIVATE))
     }
+    private val playbackQueueStore by lazy {
+        PlaybackQueueStore(getSharedPreferences(PlaybackPreferenceFiles.QUEUE, MODE_PRIVATE))
+    }
     private val subtitlePreferencesStore by lazy {
         SubtitlePreferencesStore(getSharedPreferences(PlaybackPreferenceFiles.SUBTITLES, MODE_PRIVATE))
     }
@@ -86,7 +91,12 @@ class PlaybackService : MediaSessionService() {
             .setSeekBackIncrementMs(10_000)
             .setSeekForwardIncrementMs(30_000)
             .build()
+        player.repeatMode = playbackQueueStore.mode().repeatMode
         player.addListener(object : androidx.media3.common.Player.Listener {
+            override fun onRepeatModeChanged(repeatMode: Int) {
+                playbackQueueStore.saveMode(PlaybackMode.fromRepeatMode(repeatMode))
+            }
+
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
                 attachLoudnessEnhancer(audioSessionId)
             }

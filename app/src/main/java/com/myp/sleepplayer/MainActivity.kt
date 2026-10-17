@@ -68,10 +68,14 @@ import com.myp.sleepplayer.media.MediaScanner
 import com.myp.sleepplayer.media.isExtension
 import com.myp.sleepplayer.media.isSupportedMedia
 import com.myp.sleepplayer.media.isSubtitleFile
+import com.myp.sleepplayer.media.mediaType
 import com.myp.sleepplayer.playback.PlaybackCoordinator
 import com.myp.sleepplayer.playback.PlaybackControlSettings
 import com.myp.sleepplayer.playback.PlaybackControlStore
 import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
+import com.myp.sleepplayer.playback.PlaybackMode
+import com.myp.sleepplayer.playback.PlaybackQueue
+import com.myp.sleepplayer.playback.PlaybackQueueStore
 import com.myp.sleepplayer.playback.PlaybackStateStore
 import com.myp.sleepplayer.playback.SleepTimerStore
 import com.myp.sleepplayer.playback.SubtitlePreferencesStore
@@ -225,6 +229,10 @@ class MainActivity : Activity() {
     private var scrubOverlayView: TextView? = null
     private var subtitleButton: Button? = null
     private var loadedEntries: List<MediaEntry> = emptyList()
+    private var activeEntries: List<MediaEntry> = emptyList()
+    private var librarySource: String? = null
+    private var isLibraryLoading = false
+    private var queueSelection: List<String>? = null
     private var currentResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
     private var videoScale = 1f
     private var lastVolume = 1f
@@ -287,6 +295,9 @@ class MainActivity : Activity() {
         PlaybackStateStore(getSharedPreferences(PlaybackPreferenceFiles.CONTROLS, MODE_PRIVATE))
     }
     private val playbackCoordinator by lazy { PlaybackCoordinator(playbackStateStore) }
+    private val playbackQueueStore by lazy {
+        PlaybackQueueStore(getSharedPreferences(PlaybackPreferenceFiles.QUEUE, MODE_PRIVATE))
+    }
     private val sleepTimerStore by lazy {
         SleepTimerStore(getSharedPreferences(PlaybackPreferenceFiles.SLEEP_TIMER, MODE_PRIVATE))
     }
@@ -466,13 +477,7 @@ class MainActivity : Activity() {
             )
             setBackgroundResource(selectableBackground.resourceId)
             imageTintList = android.content.res.ColorStateList.valueOf(Color.rgb(220, 228, 237))
-            setOnClickListener {
-                controller?.let { player ->
-                    val playbackRequested = player.playWhenReady &&
-                        player.playbackState != Player.STATE_ENDED
-                    if (playbackRequested) player.pause() else player.play()
-                }
-            }
+            setOnClickListener { playbackCoordinator.togglePlayback() }
         }
         updatePlaybackButton()
 
@@ -497,6 +502,7 @@ class MainActivity : Activity() {
         libraryScroll.addView(libraryContainer)
         root.addView(libraryScroll)
         setContentView(root)
+        renderLibrary()
     }
 
     private fun connectController() {
@@ -545,7 +551,8 @@ class MainActivity : Activity() {
                 })
                 updateScreenAwakeState()
                 controller?.setPlaybackSpeed(playbackSpeed)
-                if (loadedEntries.isNotEmpty()) playbackCoordinator.applyPlaylist(loadedEntries)
+                controller?.repeatMode = playbackQueueStore.mode().repeatMode
+                if (librarySource != null && !isLibraryLoading) applyPlaybackQueue()
             } catch (error: Exception) {
                 Toast.makeText(
                     this@MainActivity,
@@ -625,37 +632,61 @@ class MainActivity : Activity() {
 
     private fun showFileDirectoryPicker(initialDirectory: File) {
         var currentDirectory = initialDirectory
+        val storageRoot = Environment.getExternalStorageDirectory().canonicalFile
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(4), dp(16), 0)
         }
-        val pathView = TextView(this).apply {
-            setTextColor(Color.rgb(232, 237, 243))
-            textSize = 13f
-            setPadding(0, 0, 0, dp(6))
+        val pathBar = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            background = getDrawable(R.drawable.player_button_background)
+            setPadding(dp(4), dp(4), dp(12), dp(4))
         }
-        val upButton = Button(this).apply {
-            text = "↑ 上一级"
-            isAllCaps = false
+        val pathView = TextView(this).apply {
+            setTextColor(getColor(R.color.player_text))
+            textSize = 13f
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.MIDDLE
+            setTextIsSelectable(true)
+        }
+        val upButton = ImageButton(this).apply {
+            setImageResource(R.drawable.ic_expand_less)
+            rotation = -90f
+            background = null
+            contentDescription = "返回上一级目录"
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+        pathBar.addView(upButton, LinearLayout.LayoutParams(dp(48), dp(48)))
+        pathBar.addView(pathView, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val statusView = TextView(this).apply {
+            textSize = 12f
+            setTextColor(getColor(R.color.player_text_muted))
+            setPadding(dp(2), dp(12), 0, dp(8))
         }
         val directoryContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
         val scroll = ScrollView(this).apply {
             addView(directoryContainer)
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
         }
-        panel.addView(pathView)
-        panel.addView(upButton)
+        panel.addView(pathBar)
+        panel.addView(statusView)
         panel.addView(
             scroll,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(420))
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                (resources.displayMetrics.heightPixels * 0.48f).toInt())
         )
 
         fun renderDirectory() {
-            pathView.text = currentDirectory.absolutePath
-            val storageRoot = Environment.getExternalStorageDirectory().canonicalFile
+            val relativePath = currentDirectory.canonicalPath.removePrefix(storageRoot.path).trimStart('/')
+            pathView.text = "共享存储" + if (relativePath.isNotEmpty()) " / ${relativePath.replace("/", " / ")}" else ""
+            pathView.contentDescription = currentDirectory.absolutePath
             upButton.isEnabled = currentDirectory.canonicalFile != storageRoot
+            upButton.alpha = if (upButton.isEnabled) 1f else 0.3f
             directoryContainer.removeAllViews()
+            scroll.scrollTo(0, 0)
             val children = try {
                 currentDirectory.listFiles()
                     ?.filter { it.canRead() }
@@ -671,68 +702,77 @@ class MainActivity : Activity() {
             val playableCount = files.count { isSupportedMedia(it.name) }
             val subtitleCount = files.count { isSubtitleFile(it.name) }
 
-            directoryContainer.addView(TextView(this).apply {
-                text = buildString {
+            statusView.text = buildString {
                     append("${directories.size} 个子目录 · ${files.size} 个文件")
                     if (playableCount > 0) append(" · ${playableCount} 个可播放")
-                    if (subtitleCount > 0) append(" · ${subtitleCount} 个字幕")
                 }
-                textSize = 12f
-                setTextColor(Color.rgb(174, 181, 192))
-                setPadding(0, dp(4), 0, dp(8))
-            })
 
             if (directories.isNotEmpty()) {
-                directoryContainer.addView(TextView(this).apply {
-                    text = "子目录"
-                    textSize = 13f
-                    setTypeface(typeface, android.graphics.Typeface.BOLD)
-                    setTextColor(Color.WHITE)
-                    setPadding(0, dp(4), 0, dp(2))
-                })
                 directories.forEach { directory ->
-                    directoryContainer.addView(Button(this).apply {
-                        text = if (directory.name.startsWith('.')) {
-                            "● ${directory.name}  （隐藏）"
-                        } else {
-                            "▸ ${directory.name}"
-                        }
-                        gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                        isAllCaps = false
-                        setTextColor(Color.rgb(232, 237, 243))
+                    directoryContainer.addView(LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        background = getDrawable(R.drawable.player_button_background)
+                        setPadding(dp(12), 0, dp(12), 0)
+                        addView(ImageView(this@MainActivity).apply {
+                            setImageResource(R.drawable.ic_folder_open)
+                            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                        }, LinearLayout.LayoutParams(dp(24), dp(24)))
+                        addView(TextView(this@MainActivity).apply {
+                            text = directory.name
+                            textSize = 15f
+                            maxLines = 2
+                            ellipsize = TextUtils.TruncateAt.MIDDLE
+                            setPadding(dp(12), 0, dp(8), 0)
+                        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                        if (directory.name.startsWith('.')) addView(TextView(this@MainActivity).apply {
+                            text = "隐藏"
+                            textSize = 11f
+                            setTextColor(getColor(R.color.player_text_muted))
+                            setPadding(0, 0, dp(8), 0)
+                        })
+                        addView(ImageView(this@MainActivity).apply {
+                            setImageResource(R.drawable.ic_chevron_right)
+                            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                        }, LinearLayout.LayoutParams(dp(20), dp(20)))
+                        isFocusable = true
+                        contentDescription = "打开目录 ${directory.name}"
                         setOnClickListener {
                             currentDirectory = directory
                             renderDirectory()
                         }
+                    }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64)).apply {
+                        bottomMargin = dp(8)
                     })
                 }
             }
 
             if (files.isNotEmpty()) {
                 directoryContainer.addView(TextView(this).apply {
-                    text = "当前目录内容"
+                    text = "文件" + if (subtitleCount > 0) " · 含 $subtitleCount 个字幕" else ""
                     textSize = 13f
                     setTypeface(typeface, android.graphics.Typeface.BOLD)
-                    setTextColor(Color.WHITE)
-                    setPadding(0, dp(10), 0, dp(2))
+                    setTextColor(getColor(R.color.player_text_muted))
+                    setPadding(dp(2), dp(8), 0, dp(8))
                 })
                 val previewLimit = 40
                 files.take(previewLimit).forEach { file ->
-                    val label = when {
-                        isExtension(file.name, "mp4") -> "[视频]"
-                        isExtension(file.name, "mp3") || isExtension(file.name, "wav") -> "[音频]"
-                        isSubtitleFile(file.name) -> "[字幕]"
-                        else -> "[文件]"
-                    }
-                    directoryContainer.addView(TextView(this).apply {
-                        text = "$label ${file.name}"
+                    val preview = if (isSupportedMedia(file.name)) {
+                        createMediaPreview(MediaEntry(file.name, Uri.fromFile(file), mediaType(file.name), emptyList()),
+                            maxLines = 2, compact = true)
+                    } else TextView(this).apply {
+                        text = (if (isSubtitleFile(file.name)) "字幕 · " else "文件 · ") + file.name
                         textSize = 13f
-                        setTextColor(Color.rgb(232, 237, 243))
-                        maxLines = 1
+                        setTextColor(getColor(R.color.player_text_muted))
+                        maxLines = 2
                         ellipsize = TextUtils.TruncateAt.MIDDLE
-                        setPadding(dp(8), dp(6), dp(8), dp(6))
-                        setBackgroundColor(Color.rgb(27, 33, 40))
-                    })
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(dp(12), dp(8), dp(12), dp(8))
+                        background = getDrawable(R.drawable.player_button_background)
+                    }
+                    directoryContainer.addView(preview, LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, dp(if (isSupportedMedia(file.name)) 72 else 48)
+                    ).apply { bottomMargin = dp(6) })
                 }
                 if (files.size > previewLimit) {
                     directoryContainer.addView(TextView(this).apply {
@@ -754,15 +794,14 @@ class MainActivity : Activity() {
             }
         }
         upButton.setOnClickListener {
-            val storageRoot = Environment.getExternalStorageDirectory().canonicalFile
             val parent = currentDirectory.parentFile?.canonicalFile
-            if (parent != null && parent.absolutePath.startsWith(storageRoot.absolutePath)) {
+            if (parent != null && (parent == storageRoot || parent.path.startsWith(storageRoot.path + File.separator))) {
                 currentDirectory = parent
                 renderDirectory()
             }
         }
         renderDirectory()
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("选择媒体目录")
             .setView(panel)
             .setNegativeButton("取消", null)
@@ -774,6 +813,7 @@ class MainActivity : Activity() {
                 scanFileDirectory(currentDirectory)
             }
             .show()
+        dialog.window?.setLayout(resources.displayMetrics.widthPixels - dp(24), ViewGroup.LayoutParams.WRAP_CONTENT)
     }
 
     private fun loadSavedTree() {
@@ -789,7 +829,7 @@ class MainActivity : Activity() {
         Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()
 
     private fun scanDocumentTree(uri: Uri) {
-        val requestId = beginScan()
+        val requestId = beginScan(uri.toString())
         scanFuture = scanExecutor.submit {
             val entries = try {
                 val root = DocumentFile.fromTreeUri(this, uri)
@@ -804,7 +844,7 @@ class MainActivity : Activity() {
     }
 
     private fun scanFileDirectory(directory: File) {
-        val requestId = beginScan()
+        val requestId = beginScan(directory.absolutePath)
         scanFuture = scanExecutor.submit {
             val entries = try {
                 mediaScanner.scanFileDirectory(directory)
@@ -817,7 +857,9 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun beginScan(): Int {
+    private fun beginScan(source: String): Int {
+        librarySource = source
+        isLibraryLoading = true
         scanFuture?.cancel(true)
         thumbnailGeneration += 1
         synchronized(thumbnailFutures) {
@@ -853,8 +895,10 @@ class MainActivity : Activity() {
 
     private fun finishScan(entries: List<MediaEntry>) {
         loadedEntries = entries.sortedBy { it.name.lowercase(Locale.ROOT) }
+        isLibraryLoading = false
+        queueSelection = librarySource?.let(playbackQueueStore::selection)
         renderLibrary()
-        playbackCoordinator.applyPlaylist(loadedEntries)
+        applyPlaybackQueue()
     }
 
     private fun renderLibrary() {
@@ -862,7 +906,7 @@ class MainActivity : Activity() {
         container.removeAllViews()
         if (loadedEntries.isEmpty()) {
             container.addView(TextView(this).apply {
-                text = "目录为空"
+                text = if (librarySource == null) "先选择媒体目录，再设置循环列表。" else "目录为空"
                 textSize = 15f
                 setTextColor(Color.rgb(171, 181, 196))
                 setPadding(0, dp(12), 0, dp(12))
@@ -892,7 +936,7 @@ class MainActivity : Activity() {
                 videoBody.visibility = if (videoPreviewCollapsed) View.GONE else View.VISIBLE
             }
             videoEntries.forEach { indexed ->
-                addLibraryEntry(videoBody, indexed.index, indexed.value)
+                addLibraryEntry(videoBody, indexed.value)
             }
             videoSection.addView(videoBody)
             container.addView(videoSection)
@@ -919,7 +963,7 @@ class MainActivity : Activity() {
                 audioBody.visibility = if (audioSectionCollapsed) View.GONE else View.VISIBLE
             }
             audioEntries.forEach { indexed ->
-                addLibraryEntry(audioBody, indexed.index, indexed.value)
+                addLibraryEntry(audioBody, indexed.value)
             }
             audioSection.addView(audioBody)
             container.addView(audioSection)
@@ -983,23 +1027,27 @@ class MainActivity : Activity() {
 
     private fun addLibraryEntry(
         container: LinearLayout,
-        index: Int,
         entry: MediaEntry
     ) {
-        val rowHeight = if (entry.isVideo) dp(64) else dp(52)
+        container.addView(createMediaPreview(entry).apply {
+            isClickable = true
+            isFocusable = true
+            contentDescription = "${entry.name}，播放"
+            setOnClickListener { playLibraryEntry(entry) }
+        })
+    }
+
+    private fun createMediaPreview(entry: MediaEntry, label: String = entry.name, maxLines: Int = 1, compact: Boolean = false): View {
+        val rowHeight = if (maxLines > 1) dp(72) else if (entry.isVideo) dp(64) else dp(52)
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                rowHeight
+                ViewGroup.LayoutParams.MATCH_PARENT, rowHeight
             ).apply { bottomMargin = dp(2) }
             setPadding(0, 0, dp(10), 0)
             background = mediaRowBackground()
-            isClickable = true
-            isFocusable = true
-            contentDescription = "${entry.name}，播放"
-            setOnClickListener { playbackCoordinator.playEntry(index) }
+            clipToOutline = true
         }
         if (entry.isVideo) {
             val thumbnail = ImageView(this).apply {
@@ -1007,22 +1055,32 @@ class MainActivity : Activity() {
                 setImageResource(android.R.drawable.ic_media_play)
                 scaleType = ImageView.ScaleType.CENTER_CROP
                 contentDescription = "${entry.name} 封面"
-                layoutParams = LinearLayout.LayoutParams(dp(112), ViewGroup.LayoutParams.MATCH_PARENT)
+                layoutParams = LinearLayout.LayoutParams(dp(if (compact) 80 else 112), ViewGroup.LayoutParams.MATCH_PARENT)
             }
             row.addView(thumbnail)
             loadVideoThumbnail(entry, thumbnail)
         }
-        row.addView(TextView(this).apply {
-            text = entry.name
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            textSize = 14f
-            setTextColor(Color.rgb(232, 237, 243))
-            setSingleLine(true)
-            ellipsize = TextUtils.TruncateAt.END
+        val textColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(12), 0, dp(4), 0)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+        }
+        textColumn.addView(TextView(this).apply {
+            text = label
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            textSize = if (compact) 13f else 14f
+            setTextColor(Color.rgb(232, 237, 243))
+            this.maxLines = maxLines
+            ellipsize = TextUtils.TruncateAt.END
         })
-        if (entry.subtitles.isNotEmpty()) {
+        if (compact) textColumn.addView(TextView(this).apply {
+            text = entry.type.name + if (entry.subtitles.isNotEmpty()) " · 字幕 ${entry.subtitles.size}" else ""
+            textSize = 11f
+            setTextColor(getColor(R.color.player_text_muted))
+            setPadding(0, dp(3), 0, 0)
+        })
+        row.addView(textColumn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+        if (!compact && entry.subtitles.isNotEmpty()) {
             row.addView(TextView(this).apply {
                 text = if (entry.subtitles.size == 1) "字幕" else "字幕 ${entry.subtitles.size}"
                 gravity = Gravity.CENTER
@@ -1045,7 +1103,7 @@ class MainActivity : Activity() {
                 }
             })
         }
-        container.addView(row)
+        return row
     }
 
     private fun mediaRowBackground(): StateListDrawable = statefulBackground(
@@ -1118,6 +1176,67 @@ class MainActivity : Activity() {
         return scaled
     }
 
+    private fun currentPlaybackMode(): PlaybackMode = controller?.let {
+        PlaybackMode.fromRepeatMode(it.repeatMode)
+    } ?: playbackQueueStore.mode()
+
+    private fun setPlaybackMode(mode: PlaybackMode) {
+        playbackQueueStore.saveMode(mode)
+        controller?.repeatMode = mode.repeatMode
+    }
+
+    private fun applyPlaybackQueue() {
+        val byUri = loadedEntries.associateBy { it.uri.toString() }
+        activeEntries = PlaybackQueue.resolve(byUri.keys.toList(), queueSelection).map(byUri::getValue)
+        playbackCoordinator.applyPlaylist(activeEntries)
+    }
+
+    private fun savePlaybackQueue(selection: List<String>?, loopEnabled: Boolean, startPlayback: Boolean) {
+        val source = librarySource ?: return
+        queueSelection = selection
+        playbackQueueStore.saveSelection(source, selection)
+        applyPlaybackQueue()
+        setPlaybackMode(if (loopEnabled) PlaybackMode.REPEAT_ALL else PlaybackMode.SEQUENTIAL)
+        if (startPlayback && activeEntries.isNotEmpty()) playbackCoordinator.playEntry(0)
+        playbackCoordinator.savePosition()
+    }
+
+    private fun showPlaybackQueue() {
+        if (isLibraryLoading || loadedEntries.isEmpty() || controller == null) return
+        PlaybackQueueDialog(
+            activity = this,
+            available = loadedEntries,
+            savedSelection = queueSelection,
+            currentUri = controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
+            loopEnabled = currentPlaybackMode() == PlaybackMode.REPEAT_ALL,
+            createPreview = { entry, label -> createMediaPreview(entry, label, maxLines = 2, compact = true) },
+            onSave = ::savePlaybackQueue
+        ).show()
+    }
+
+    private fun playLibraryEntry(entry: MediaEntry) {
+        if (controller == null) {
+            Toast.makeText(this, "播放器正在连接，请稍后重试", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val index = activeEntries.indexOfFirst { it.uri == entry.uri }
+        if (index >= 0) {
+            playbackCoordinator.playEntry(index)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(entry.name)
+            .setItems(arrayOf("加入循环列表并播放", "使用全部媒体播放")) { _, choice ->
+                val selection = if (choice == 0) {
+                    (queueSelection.orEmpty() + entry.uri.toString()).distinct()
+                } else null
+                savePlaybackQueue(selection, currentPlaybackMode() == PlaybackMode.REPEAT_ALL, startPlayback = false)
+                playbackCoordinator.playEntry(activeEntries.indexOfFirst { it.uri == entry.uri })
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
     private fun showTimerMenu(anchor: android.view.View) {
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1126,29 +1245,33 @@ class MainActivity : Activity() {
         val countdownView = TextView(this).apply {
             gravity = Gravity.CENTER
             textSize = 24f
-            setTextColor(Color.WHITE)
+            setTextColor(getColor(R.color.player_accent))
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setPadding(0, dp(8), 0, dp(12))
+            background = getDrawable(R.drawable.player_button_background)
         }
         panel.addView(countdownView)
         panel.addView(TextView(this).apply {
             text = "快速设置"
             textSize = 13f
             setTextColor(Color.rgb(171, 181, 196))
-            setPadding(0, 0, 0, dp(4))
+            setPadding(0, dp(16), 0, dp(8))
         })
-        listOf(15, 30, 60, 90).forEach { minutes ->
-            panel.addView(Button(this).apply {
-                text = "${minutes} 分钟"
-                isAllCaps = false
-                setOnClickListener { setTimer(minutes) }
+        listOf(15, 30, 60, 90).chunked(2).forEach { pair ->
+            panel.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                pair.forEachIndexed { index, minutes ->
+                    addView(Button(this@MainActivity).apply {
+                        text = "${minutes} 分钟"
+                        setOnClickListener { setTimer(minutes) }
+                    }, LinearLayout.LayoutParams(0, dp(48), 1f).apply {
+                        if (index == 0) marginEnd = dp(8)
+                    })
+                }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)).apply {
+                bottomMargin = dp(8)
             })
         }
-        panel.addView(Button(this).apply {
-            text = "关闭定时"
-            isAllCaps = false
-            setOnClickListener { setTimer(0) }
-        })
         panel.addView(TextView(this).apply {
             text = "自定义时长（分钟）"
             textSize = 13f
@@ -1161,9 +1284,11 @@ class MainActivity : Activity() {
             setSingleLine(true)
             contentDescription = "自定义定时分钟数"
         }
-        panel.addView(customInput)
-        panel.addView(Button(this).apply {
-            text = "设置自定义定时"
+        val customRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        customRow.addView(customInput, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(8) })
+        customRow.addView(Button(this).apply {
+            text = "设置"
+            contentDescription = "设置自定义定时"
             isAllCaps = false
             setOnClickListener {
                 val minutes = customInput.text.toString().trim().toIntOrNull()
@@ -1175,11 +1300,13 @@ class MainActivity : Activity() {
                     customInput.text.clear()
                 }
             }
-        })
+        }, LinearLayout.LayoutParams(dp(80), dp(48)))
+        panel.addView(customRow)
 
         val dialog = AlertDialog.Builder(this)
             .setTitle("睡眠定时")
-            .setView(panel)
+            .setView(dialogScroll(panel))
+            .setNeutralButton("关闭定时") { _, _ -> setTimer(0) }
             .setNegativeButton("关闭页面", null)
             .create()
         timerCountdownView = countdownView
@@ -1189,6 +1316,7 @@ class MainActivity : Activity() {
             if (timerDialog === dialog) timerDialog = null
         }
         dialog.show()
+        dialog.window?.setLayout(dialogWidth(), ViewGroup.LayoutParams.WRAP_CONTENT)
         updateTimerUi()
     }
 
@@ -1225,6 +1353,10 @@ class MainActivity : Activity() {
 
     private fun showPlayerSettingsMenu(anchor: View) {
         PopupMenu(this, anchor).apply {
+            menu.add("循环列表 · ${activeEntries.size} 项 · ${if (currentPlaybackMode() == PlaybackMode.REPEAT_ALL) "已开启" else "未开启"}").apply {
+                isEnabled = !isLibraryLoading && loadedEntries.isNotEmpty() && controller != null
+                setOnMenuItemClickListener { showPlaybackQueue(); true }
+            }
             menu.addSubMenu("画面设置").apply {
                 add("适配画面").setOnMenuItemClickListener {
                     setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
@@ -1292,10 +1424,14 @@ class MainActivity : Activity() {
         val overlayCheck = CheckBox(this).apply {
             text = "退到后台时显示悬浮字幕"
             isChecked = subtitleOverlayEnabled
+            minHeight = dp(48)
+            textSize = 14f
         }
         val snapSeekCheck = CheckBox(this).apply {
             text = "有字幕时，滑动对齐字幕起始点"
             isChecked = snapSeekToCueStarts
+            minHeight = dp(48)
+            textSize = 14f
         }
         panel.addView(snapSeekCheck)
         panel.addView(overlayCheck)
@@ -1305,20 +1441,28 @@ class MainActivity : Activity() {
             setOnClickListener { requestOverlayPermission() }
         })
 
-        val sizeLabel = TextView(this)
+        fun settingLabel() = TextView(this).apply {
+            textSize = 13f
+            setTextColor(getColor(R.color.player_text_muted))
+            setPadding(0, dp(12), 0, 0)
+        }
+        val sizeLabel = settingLabel()
         val sizeSeek = SeekBar(this).apply {
             max = 24
             progress = (subtitleSizeSp - 12f).roundToInt()
+            minimumHeight = dp(48)
         }
-        val alphaLabel = TextView(this)
+        val alphaLabel = settingLabel()
         val alphaSeek = SeekBar(this).apply {
             max = 255
             progress = subtitleBackgroundAlpha
+            minimumHeight = dp(48)
         }
-        val bottomLabel = TextView(this)
+        val bottomLabel = settingLabel()
         val bottomSeek = SeekBar(this).apply {
             max = 172
             progress = subtitleBottomDp - 8
+            minimumHeight = dp(48)
         }
         val colorButton = Button(this).apply {
             isAllCaps = false
@@ -1333,7 +1477,10 @@ class MainActivity : Activity() {
             colorButton.text = "字幕颜色：${subtitleColorName(subtitleColor)}"
             preview.textSize = size
             preview.setTextColor(subtitleColor)
-            preview.setBackgroundColor(Color.argb(alpha, 0, 0, 0))
+            preview.background = GradientDrawable().apply {
+                setColor(Color.argb(alpha, 0, 0, 0))
+                cornerRadius = dp(8).toFloat()
+            }
         }
         colorButton.setOnClickListener { anchor ->
             PopupMenu(this, anchor).apply {
@@ -1364,9 +1511,9 @@ class MainActivity : Activity() {
         panel.addView(colorButton)
         updatePreview()
 
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("字幕设置")
-            .setView(panel)
+            .setView(dialogScroll(panel))
             .setNegativeButton("取消", null)
             .setPositiveButton("保存") { _, _ ->
                 val canOverlay = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
@@ -1383,6 +1530,14 @@ class MainActivity : Activity() {
                 sendSubtitleSettings()
             }
             .show()
+        dialog.window?.setLayout(dialogWidth(), ViewGroup.LayoutParams.WRAP_CONTENT)
+    }
+
+    private fun dialogWidth() = minOf(resources.displayMetrics.widthPixels - dp(24), dp(560))
+
+    private fun dialogScroll(content: View) = ScrollView(this).apply {
+        isVerticalScrollBarEnabled = false
+        addView(content)
     }
 
     private fun previewSeekListener(onChanged: () -> Unit): SeekBar.OnSeekBarChangeListener =
@@ -1999,9 +2154,7 @@ class MainActivity : Activity() {
                     lastVideoTapUpTime = 0L
                     scrubGestureEligible = false
                     touchGestureEligible = false
-                    controller?.let { player ->
-                        if (player.isPlaying) player.pause() else player.play()
-                    }
+                    playbackCoordinator.togglePlayback()
                     playerView?.showController()
                     return true
                 }

@@ -6,7 +6,7 @@
 
 名称保持「夜莺播放器 · Nightingale」，使用与 Windows 版一致的月牙与青鸟图标，与媒体制作工具「织声 · Soundweaver」配套。自适应图标和安全区说明见 [品牌资源](assets/branding/README.md)。
 
-当前源码版本由 `app/build.gradle.kts` 定义：`versionName = "0.2.6"`、`versionCode = 9`，最低 Android 8.0（API 26）。内部包名/applicationId `com.myp.sleepplayer`、项目目录 `NightingalePlayer`、已有偏好文件和模拟器媒体目录 `SleepVideoPlayer` 保持兼容，不随对外名称更改。已有 APK 可能来自较早的构建，不能仅凭文件名认定与当前源码一致。
+当前源码版本由 `app/build.gradle.kts` 定义：`versionName = "0.3.0"`、`versionCode = 10`，最低 Android 8.0（API 26）。内部包名/applicationId `com.myp.sleepplayer`、项目目录 `NightingalePlayer`、已有偏好文件和模拟器媒体目录 `SleepVideoPlayer` 保持兼容，不随对外名称更改。已有 APK 可能来自较早的构建，不能仅凭文件名认定与当前源码一致。
 
 ## 已实现
 
@@ -20,6 +20,7 @@
 - 后台字幕：授权悬浮窗后，退到后台播放时显示当前 VTT 字幕；回到播放器后自动隐藏。
 - 字幕样式：字幕设置中可实时预览并调整字号、颜色、背景透明度和底部距离。
 - 播放恢复：退到后台或重新进入应用时恢复媒体、位置和播放状态。
+- 循环列表：从播放器设置选择媒体并开启循环，一项重复播放，多项按列表顺序循环；可在当前目录（含子目录）选择媒体、拖动排序或长按移除，每个目录独立保存序列。循环由后台播放服务执行，睡眠定时到期仍会暂停。
 - MP4 预览：媒体库将 MP4 与 MP3/WAV 分开展示，并在每个 MP4 条目旁直接显示视频首帧缩略图。
 
 ## 代码架构
@@ -29,6 +30,7 @@
 ```text
 com.myp.sleepplayer
 ├── MainActivity.kt             页面组装、生命周期、用户交互和 Android UI
+├── PlaybackQueueDialog.kt      播放列表草稿编辑、选曲和调整顺序
 ├── PlaybackService.kt          MediaSession/ExoPlayer 生命周期、后台播放与服务命令
 ├── media/
 │   ├── MediaModels.kt          媒体/字幕数据模型和文件类型
@@ -37,6 +39,8 @@ com.myp.sleepplayer
 │   └── SubtitleSupport.kt      LRC 时间戳解析和 WebVTT 时间格式化
 └── playback/
     ├── PlaybackCoordinator.kt  播放列表装载、恢复决策和条目播放
+    ├── PlaybackQueue.kt        循环模式、选曲/顺序与恢复决策
+    ├── PlaybackQueueStore.kt   循环模式和各目录序列的持久化
     ├── PlaybackStateStore.kt   播放位置快照的 SharedPreferences 读写
     ├── PlaybackControlStore.kt 音量、倍速、增益和画面模式偏好
     ├── SleepTimerStore.kt      定时截止时间偏好
@@ -59,6 +63,14 @@ PlaybackService ──> Media3 player/session
 服务命令仍通过现有的 `Intent` action 在 Activity 与 `PlaybackService` 之间传递；偏好 store 只负责持久化，不替代服务命令通道。Activity 通过 `PlaybackControlStore` 保存音量、静音、倍速、增益和画面模式；`PlaybackService` 通过同一 store 在处理增益命令时保存增益。定时和字幕设置由 `PlaybackService` 写入对应 store，Activity 读取这些值用于显示。后续扩展优先将纯字幕时间轴与 cue 查找放入 `media`，将 seek 策略放入 `playback`，UI 只发出操作并显示结果；只有在职责和依赖稳定后再考虑继续拆分手势、设置弹窗或 Service 管理器。当前分层不改变支持的媒体格式、扫描顺序、字幕匹配规则、LRC 转换缓存、播放恢复或现有控制行为。
 
 字幕与定位自检覆盖 LRC offset、多时间戳、VTT cue 起点、重复起点、末尾 cue 时长、WebVTT 输出和最近字幕起点吸附；环境与命令见下方“构建与自动检查”。
+
+## 循环列表
+
+点播放器齿轮设置中的“循环列表”，在同一个窗口里选择媒体、调整顺序和开关“循环播放”。列表只有一项时重复播放这一项，多项时按编号依次播放并回到第一项；关闭循环后，播放到末项结束。普通页面和全屏共用这个入口。
+
+编辑列表和“选择媒体”窗口复用媒体库现有的 MP4 缩略图与字幕标记，音频显示文件名和格式。按住卡片任意位置上下拖动即可排序；长按不动进入移除模式，所有卡片右上角一起显示 ×，可连续点击剔除条目。点任意卡片中间收起全部 ×，恢复拖动排序。移除只影响列表，不删除媒体文件。无障碍操作菜单另提供上移、下移和显示移除按钮。点击“保存”应用列表和循环开关；当前项仍在列表时保留进度与播放/暂停状态，当前项被移除时停在新列表第一项，等待手动播放。“开始循环”会保存列表、开启循环并从第一项开始。取消编辑不影响现有播放。
+
+“全部媒体”恢复按目录文件名排序的列表，后续新增文件也会纳入；自定义列表只播放已选媒体。列表按目录分别记忆，不在目录扫描结果中的文件会跳过，编辑页会显示缺失项数量；全部缺失时暂停并清空播放队列，可重新选择媒体。点击不在自定义列表中的媒体时，可选择加入列表并播放，或切回全部媒体播放。
 
 ## 模拟器调试
 
@@ -97,9 +109,10 @@ APK 输出在 `app\build\outputs\apk\debug\app-debug.apk`。这是只构建入�
 
 ```powershell
 .\gradlew.bat --console=plain :app:verifySubtitleSupport
+.\gradlew.bat --console=plain :app:verifyPlaybackQueue
 ```
 
-它会编译相关测试类并执行 JVM 检查，仍会写构建与依赖缓存；通过不代表播放、手势、后台服务或权限交互已经验收。
+它们会编译相关测试类并执行 JVM 检查，仍会写构建与依赖缓存。播放列表检查覆盖选曲、排序、缺失文件、无效移动和进度恢复；通过不代表设备上的播放、手势、后台服务或权限交互已经验收。
 
 构建发布包：
 
