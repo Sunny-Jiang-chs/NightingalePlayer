@@ -2,7 +2,7 @@ package com.myp.sleepplayer.playback
 
 internal enum class PlaybackMode(val repeatMode: Int, val label: String) {
     SEQUENTIAL(0, "顺序播放"),
-    REPEAT_ALL(2, "循环列表");
+    REPEAT_ALL(2, "循环播放");
 
     companion object {
         fun fromRepeatMode(value: Int): PlaybackMode =

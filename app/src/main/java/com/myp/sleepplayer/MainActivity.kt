@@ -8,14 +8,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Canvas
-import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -26,6 +25,7 @@ import android.provider.DocumentsContract
 import android.provider.Settings
 import android.text.InputType
 import android.text.TextUtils
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -74,8 +74,8 @@ import com.myp.sleepplayer.playback.PlaybackControlSettings
 import com.myp.sleepplayer.playback.PlaybackControlStore
 import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
 import com.myp.sleepplayer.playback.PlaybackMode
-import com.myp.sleepplayer.playback.PlaybackQueue
 import com.myp.sleepplayer.playback.PlaybackQueueStore
+import com.myp.sleepplayer.playback.SavedPlaylist
 import com.myp.sleepplayer.playback.PlaybackStateStore
 import com.myp.sleepplayer.playback.SleepTimerStore
 import com.myp.sleepplayer.playback.SubtitlePreferencesStore
@@ -207,10 +207,12 @@ class MainActivity : Activity() {
         private const val TREE_URI = "tree_uri"
         private const val DIRECTORY_PATH = "directory_path"
         private const val MAX_TIMER_MINUTES = 24 * 60
+        private const val PLAYLIST_UNDO_TIMEOUT_MS = 10_000L
+        private const val PLAYLIST_UNDO_MAX_INTERACTIONS = 3
     }
 
     private val scanExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private val thumbnailExecutor: ExecutorService = Executors.newFixedThreadPool(2)
+    private val thumbnailLoader by lazy { VideoThumbnailLoader(this) }
     private val mediaScanner by lazy {
         MediaScanner(contentResolver, File(cacheDir, "lrc-subtitles"))
     }
@@ -232,7 +234,21 @@ class MainActivity : Activity() {
     private var activeEntries: List<MediaEntry> = emptyList()
     private var librarySource: String? = null
     private var isLibraryLoading = false
-    private var queueSelection: List<String>? = null
+    private var playlistEntries: List<MediaEntry> = emptyList()
+    private var directoryPlaybackEntries: List<MediaEntry>? = null
+    private data class ClearedPlaylist(val entries: List<MediaEntry>, val resumePlaylist: Boolean, val savedId: String?)
+    private var clearedPlaylist: ClearedPlaylist? = null
+    private var playlistUndoRow: View? = null
+    private var playlistUndoInteractions = 0
+    private val playlistUndoTimeout = Runnable { dismissPlaylistUndo(animate = true) }
+    private var playlistView: PlaybackQueueView? = null
+    private var playlistLoopCheck: CheckBox? = null
+    private var playlistAddButton: Button? = null
+    private var directorySectionView: LinearLayout? = null
+    private var directoryShowsPlaylistGestures = false
+    private var directoryHasPlaylistSection = false
+    private var playlistCollapsed = false
+    private var directoryCollapsed = false
     private var currentResizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
     private var videoScale = 1f
     private var lastVolume = 1f
@@ -252,8 +268,6 @@ class MainActivity : Activity() {
     private var isActivityStarted = false
     private var scanSequence = 0
     private var scanFuture: Future<*>? = null
-    private var thumbnailGeneration = 0
-    private val thumbnailFutures = mutableListOf<Future<*>>()
     private var isSeeking = false
     private var scrubGestureEligible = false
     private var scrubGestureCaptured = false
@@ -312,7 +326,8 @@ class MainActivity : Activity() {
                 val position = formatTime(player.currentPosition)
                 val duration = formatTime(player.duration)
                 if (!isSeeking) {
-                    timingView?.text = "$position / $duration"
+                    val text = "$position / $duration"
+                    timingView?.let { if (it.text.toString() != text) it.text = text }
                 }
             }
             updateTimerUi()
@@ -336,6 +351,8 @@ class MainActivity : Activity() {
         subtitleColor = subtitleSettings.color
         subtitleBackgroundAlpha = subtitleSettings.backgroundAlpha
         subtitleBottomDp = subtitleSettings.bottomDp
+        playlistEntries = playbackQueueStore.playlist().orEmpty()
+        directoryPlaybackEntries = playbackQueueStore.directoryPlayback()
         buildUi()
         registerFullscreenBackHandler()
         connectController()
@@ -378,6 +395,7 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         header.addView(title)
+        header.addView(actionButton("歌单", R.drawable.ic_playlist, "歌单") { showSavedPlaylists() })
         header.addView(actionButton("目录", R.drawable.ic_folder_open, "选择媒体目录") {
             showDirectorySourceMenu(it)
         })
@@ -408,7 +426,7 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.BLACK)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(235)
+                normalPlayerHeight()
             )
         }
         scrubOverlayView = TextView(this).apply {
@@ -537,6 +555,14 @@ class MainActivity : Activity() {
                         updatePlaybackButton()
                     }
 
+                    override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
+                        updatePlaylistHighlight()
+                    }
+
+                    override fun onRepeatModeChanged(repeatMode: Int) {
+                        playlistLoopCheck?.isChecked = PlaybackMode.fromRepeatMode(repeatMode) == PlaybackMode.REPEAT_ALL
+                    }
+
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         updatePlaybackButton()
                     }
@@ -552,7 +578,9 @@ class MainActivity : Activity() {
                 updateScreenAwakeState()
                 controller?.setPlaybackSpeed(playbackSpeed)
                 controller?.repeatMode = playbackQueueStore.mode().repeatMode
-                if (librarySource != null && !isLibraryLoading) applyPlaybackQueue()
+                if (directoryPlaybackEntries != null || playlistEntries.isNotEmpty() ||
+                    (librarySource != null && !isLibraryLoading)) applyPlaybackQueue()
+                renderLibrary()
             } catch (error: Exception) {
                 Toast.makeText(
                     this@MainActivity,
@@ -859,114 +887,279 @@ class MainActivity : Activity() {
 
     private fun beginScan(source: String): Int {
         librarySource = source
+        loadedEntries = emptyList()
         isLibraryLoading = true
         scanFuture?.cancel(true)
-        thumbnailGeneration += 1
-        synchronized(thumbnailFutures) {
-            thumbnailFutures.forEach { it.cancel(true) }
-            thumbnailFutures.clear()
-        }
+        thumbnailLoader.cancelPending()
         val requestId = ++scanSequence
         showLibraryLoading()
         return requestId
     }
 
-    private fun showLibraryLoading() {
-        val container = libraryContainer ?: return
-        container.removeAllViews()
-        val loading = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(18), 0, dp(18))
-        }
-        loading.addView(ProgressBar(this).apply {
-            isIndeterminate = true
-            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)).apply {
-                marginEnd = dp(12)
-            }
-        })
-        loading.addView(TextView(this).apply {
-            text = "正在加载媒体目录…"
-            textSize = 14f
-            setTextColor(Color.rgb(171, 181, 196))
-        })
-        container.addView(loading)
-    }
+    private fun showLibraryLoading() = renderLibrary()
 
     private fun finishScan(entries: List<MediaEntry>) {
         loadedEntries = entries.sortedBy { it.name.lowercase(Locale.ROOT) }
         isLibraryLoading = false
-        queueSelection = librarySource?.let(playbackQueueStore::selection)
-        renderLibrary()
+        val saved = librarySource?.let { playbackQueueStore.migrateLegacySelection(it, loadedEntries) }
+            ?: playbackQueueStore.playlist()
+        val refreshed = loadedEntries.associateBy { it.uri.toString() }
+        playlistEntries = saved.orEmpty().map { refreshed[it.uri.toString()] ?: it }
+        if (playlistEntries != saved.orEmpty()) {
+            playbackQueueStore.savePlaylist(playlistEntries)
+            saveActivePlaylist()
+        }
+        directoryPlaybackEntries?.let { previous ->
+            val updated = previous.map { refreshed[it.uri.toString()] ?: it }
+            if (updated != previous) {
+                directoryPlaybackEntries = updated
+                playbackQueueStore.saveDirectoryPlayback(updated)
+            }
+        }
         applyPlaybackQueue()
+        renderLibrary()
     }
 
-    private fun renderLibrary() {
+    private fun librarySection() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(12), 0, dp(12), dp(12))
+        background = GradientDrawable().apply {
+            setColor(getColor(R.color.player_surface))
+            setStroke(dp(1), getColor(R.color.player_border))
+            cornerRadius = dp(12).toFloat()
+        }
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(12) }
+    }
+
+    private fun renderLibrary(refreshDirectory: Boolean = true) {
         val container = libraryContainer ?: return
-        container.removeAllViews()
-        if (loadedEntries.isEmpty()) {
-            container.addView(TextView(this).apply {
-                text = if (librarySource == null) "先选择媒体目录，再设置循环列表。" else "目录为空"
-                textSize = 15f
-                setTextColor(Color.rgb(171, 181, 196))
+        playlistUndoRow?.animate()?.cancel()
+        playlistUndoRow = null
+        val keepDirectory = !refreshDirectory && directorySectionView != null &&
+            directoryShowsPlaylistGestures == playlistEntries.isNotEmpty() &&
+            directoryHasPlaylistSection == hasPlaylistSection()
+        val directory = directorySectionView.takeIf { keepDirectory }
+        // Playlist edits only replace their own section; keep all directory cards.
+        val oldPlaylistSections = (0 until container.childCount).map { container.getChildAt(it) }
+            .filter { it !== directory }
+        oldPlaylistSections.forEach(container::removeView)
+        playlistView = null
+        playlistLoopCheck = null
+        if (!keepDirectory || hasPlaylistSection()) playlistAddButton = null
+        clearedPlaylist?.takeIf { playlistEntries.isEmpty() }?.let { previous ->
+            val undoRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    text = "已清空播放列表"
+                    textSize = 13f
+                    gravity = Gravity.CENTER_VERTICAL
+                    setTextColor(getColor(R.color.player_text_muted))
+                }, LinearLayout.LayoutParams(0, dp(48), 1f))
+                addView(quietAction("撤销", "撤销清空播放列表") {
+                    if (clearedPlaylist !== previous) return@quietAction
+                    playbackQueueStore.setActivePlaylistId(previous.savedId)
+                    if (previous.resumePlaylist) {
+                        directoryPlaybackEntries = null
+                        playbackQueueStore.saveDirectoryPlayback(null)
+                    }
+                    savePlaybackQueue(previous.entries)
+                })
+            }
+            playlistUndoRow = undoRow
+            container.addView(undoRow, 0)
+        }
+        if (hasPlaylistSection()) {
+            val section = librarySection()
+            val playlistName = playbackQueueStore.activePlaylistId()?.let(playbackQueueStore::playlist)?.name
+                ?: "播放列表"
+            val body = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                visibility = if (playlistCollapsed) View.GONE else View.VISIBLE
+            }
+            val title = addLibrarySectionHeader(
+                section, "$playlistName · ${playlistEntries.size} 项", "播放列表", !playlistCollapsed, primary = true
+            ) {
+                playlistCollapsed = !playlistCollapsed
+                body.visibility = if (playlistCollapsed) View.GONE else View.VISIBLE
+            }.apply {
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.MIDDLE
+                tooltipText = playlistName
+            }
+            val loopCheck = CheckBox(this).apply {
+                text = "循环"
+                textSize = 13f
+                setTextColor(getColor(R.color.player_text))
+                contentDescription = "循环播放"
+                minHeight = dp(48)
+                isChecked = currentPlaybackMode() == PlaybackMode.REPEAT_ALL
+                isEnabled = controller != null
+                setOnCheckedChangeListener { _, enabled ->
+                    val mode = if (enabled) PlaybackMode.REPEAT_ALL else PlaybackMode.SEQUENTIAL
+                    if (mode != currentPlaybackMode()) setPlaybackMode(mode)
+                }
+            }
+            playlistLoopCheck = loopCheck
+            section.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(loopCheck, LinearLayout.LayoutParams(dp(80), dp(48)))
+                addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f))
+                addView(createPlaylistMenuButton())
+                addView(quietIcon(R.drawable.ic_close, "清空当前播放列表") { clearCurrentPlaylist() })
+            })
+            playlistView = PlaybackQueueView(
+                activity = this,
+                entries = playlistEntries,
+                currentUri = controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
+                addMediaAction = createPlaylistAddButton("添加媒体"),
+                createPreview = { createMediaPreview(it, maxLines = 2, compact = true) },
+                onChange = { entries ->
+                    savePlaybackQueue(entries, refreshLibrary = false)
+                    title.text = "$playlistName · ${entries.size} 项"
+                    updatePlaylistAddButton()
+                    if (entries.isEmpty()) renderLibrary(refreshDirectory = false)
+                },
+                onPlay = ::playPlaylistEntry
+            ).also { body.addView(it) }
+            section.addView(body)
+            container.addView(section, 0)
+            updatePlaylistHighlight()
+        }
+        if (!keepDirectory) {
+            directorySectionView = createDirectorySection().also { container.addView(it) }
+            directoryShowsPlaylistGestures = playlistEntries.isNotEmpty()
+            directoryHasPlaylistSection = hasPlaylistSection()
+        }
+        updatePlaylistAddButton()
+    }
+
+    private fun createDirectorySection(): LinearLayout {
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        if (!hasPlaylistSection()) {
+            populateDirectoryBody(body)
+            return body
+        }
+        val section = librarySection()
+        body.visibility = if (directoryCollapsed) View.GONE else View.VISIBLE
+        var populated = false
+        fun populate() {
+            if (populated) return
+            populated = true
+            populateDirectoryBody(body)
+        }
+        addLibrarySectionHeader(section, "当前目录内容 · ${loadedEntries.size} 项", "当前目录内容",
+            !directoryCollapsed, primary = true) {
+            directoryCollapsed = !directoryCollapsed
+            if (!directoryCollapsed) populate()
+            body.visibility = if (directoryCollapsed) View.GONE else View.VISIBLE
+        }
+        if (!directoryCollapsed) populate()
+        section.addView(body)
+        return section
+    }
+
+    private fun populateDirectoryBody(body: LinearLayout) {
+        if (isLibraryLoading) body.addView(ProgressBar(this).apply {
+            isIndeterminate = true
+        }, LinearLayout.LayoutParams(dp(28), dp(28)))
+        if (isLibraryLoading || loadedEntries.isEmpty()) {
+            body.addView(TextView(this).apply {
+                text = when {
+                    isLibraryLoading -> "正在加载媒体目录…"
+                    librarySource == null -> "先选择媒体目录。"
+                    else -> "目录为空或暂时无法读取"
+                }
+                textSize = 14f
+                setTextColor(getColor(R.color.player_text_muted))
                 setPadding(0, dp(12), 0, dp(12))
             })
             return
         }
-        val videoEntries = loadedEntries.withIndex().filter { it.value.isVideo }
-        val audioEntries = loadedEntries.withIndex().filter { !it.value.isVideo }
-        if (videoEntries.isNotEmpty()) {
-            val videoSection = LinearLayout(this).apply {
+        fun mediaGroup(entries: List<MediaEntry>, title: String, label: String, collapsed: Boolean,
+                       onCollapsed: (Boolean) -> Unit) {
+            if (entries.isEmpty()) return
+            var hidden = collapsed
+            var populated = false
+            val group = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
+                visibility = if (hidden) View.GONE else View.VISIBLE
             }
-            val videoBody = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                visibility = if (videoPreviewCollapsed) View.GONE else View.VISIBLE
+            fun populate() {
+                if (populated) return
+                populated = true
+                entries.forEach { addLibraryEntry(group, it) }
             }
-            addLibrarySectionHeader(
-                container = videoSection,
-                title = "MP4 视频预览（${videoEntries.size}）",
-                expanded = !videoPreviewCollapsed
-            ) {
-                videoPreviewCollapsed = !videoPreviewCollapsed
-                videoBody.visibility = if (videoPreviewCollapsed) View.GONE else View.VISIBLE
+            addLibrarySectionHeader(body, title, label, !hidden) {
+                hidden = !hidden
+                onCollapsed(hidden)
+                if (!hidden) populate()
+                group.visibility = if (hidden) View.GONE else View.VISIBLE
             }
-            videoEntries.forEach { indexed ->
-                addLibraryEntry(videoBody, indexed.value)
-            }
-            videoSection.addView(videoBody)
-            container.addView(videoSection)
+            if (!hidden) populate()
+            body.addView(group)
         }
-        if (audioEntries.isNotEmpty()) {
-            val audioSection = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
-            }
-            val audioBody = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                visibility = if (audioSectionCollapsed) View.GONE else View.VISIBLE
-            }
-            addLibrarySectionHeader(
-                container = audioSection,
-                title = "音频播放（${audioEntries.size}）",
-                collapsibleLabel = "音频播放",
-                expanded = !audioSectionCollapsed
-            ) {
-                audioSectionCollapsed = !audioSectionCollapsed
-                audioBody.visibility = if (audioSectionCollapsed) View.GONE else View.VISIBLE
-            }
-            audioEntries.forEach { indexed ->
-                addLibraryEntry(audioBody, indexed.value)
-            }
-            audioSection.addView(audioBody)
-            container.addView(audioSection)
+        val videos = loadedEntries.filter { it.isVideo }
+        mediaGroup(videos, "MP4 视频预览（${videos.size}）", "视频预览", videoPreviewCollapsed) {
+            videoPreviewCollapsed = it
+        }
+        val audio = loadedEntries.filter { !it.isVideo }
+        mediaGroup(audio, "音频播放（${audio.size}）", "音频播放", audioSectionCollapsed) {
+            audioSectionCollapsed = it
+        }
+    }
+
+    private fun createPlaylistAddButton(label: String) = quietAction(label) { showAddMedia() }.apply {
+        setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_add, 0, 0, 0)
+        compoundDrawablePadding = dp(4)
+        playlistAddButton = this
+    }
+
+    private fun quietAction(label: String, description: String = label, onClick: () -> Unit) = Button(this).apply {
+        text = label
+        contentDescription = description
+        textSize = 13f
+        isAllCaps = false
+        minWidth = 0
+        minimumWidth = 0
+        setPadding(dp(8), 0, dp(8), 0)
+        setTextColor(getColor(R.color.player_accent))
+        useQuietBackground(this)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48))
+        setOnClickListener { onClick() }
+    }
+
+    private fun hasPlaylistSection() = playlistEntries.isNotEmpty() || playbackQueueStore.activePlaylistId() != null
+
+    private fun quietIcon(icon: Int, description: String, onClick: () -> Unit) = ImageButton(this).apply {
+        setImageResource(icon)
+        imageTintList = android.content.res.ColorStateList.valueOf(getColor(R.color.player_text_muted))
+        contentDescription = description
+        setPadding(dp(14), dp(14), dp(14), dp(14))
+        useQuietBackground(this)
+        layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
+        setOnClickListener { onClick() }
+    }
+
+    private fun useQuietBackground(view: View) {
+        val value = TypedValue()
+        theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, value, true)
+        view.setBackgroundResource(value.resourceId)
+    }
+
+    private fun updatePlaylistHighlight() {
+        playlistView?.updateCurrentUri(controller?.currentMediaItem?.localConfiguration?.uri?.toString())
+    }
+
+    private fun updatePlaylistAddButton() {
+        playlistAddButton?.apply {
+            isEnabled = !isLibraryLoading && availablePlaylistAdditions().isNotEmpty() && controller != null
+            alpha = if (isEnabled) 1f else 0.4f
         }
     }
 
@@ -975,8 +1168,9 @@ class MainActivity : Activity() {
         title: String,
         collapsibleLabel: String = "视频预览",
         expanded: Boolean? = null,
+        primary: Boolean = false,
         onToggle: (() -> Unit)? = null
-    ) {
+    ): TextView {
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -985,14 +1179,15 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         }
-        header.addView(TextView(this).apply {
+        val titleView = TextView(this).apply {
             text = title
-            textSize = 15f
-            setTextColor(Color.WHITE)
+            textSize = if (primary) 16f else 14f
+            setTextColor(getColor(if (primary) R.color.player_text else R.color.player_text_muted))
             setTypeface(typeface, android.graphics.Typeface.BOLD)
             setPadding(0, dp(12), 0, dp(6))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        })
+        }
+        header.addView(titleView)
         if (expanded != null && onToggle != null) {
             var isExpanded = expanded == true
             header.addView(ImageButton(this).apply {
@@ -1009,9 +1204,7 @@ class MainActivity : Activity() {
                     true
                 )
                 setBackgroundResource(selectableBackground.resourceId)
-                layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply {
-                    bottomMargin = dp(2)
-                }
+                layoutParams = LinearLayout.LayoutParams(dp(48), dp(48))
                 setOnClickListener {
                     onToggle()
                     isExpanded = !isExpanded
@@ -1023,6 +1216,7 @@ class MainActivity : Activity() {
             })
         }
         container.addView(header)
+        return titleView
     }
 
     private fun addLibraryEntry(
@@ -1033,7 +1227,38 @@ class MainActivity : Activity() {
             isClickable = true
             isFocusable = true
             contentDescription = "${entry.name}，播放"
-            setOnClickListener { playLibraryEntry(entry) }
+            setOnClickListener { playDirectoryEntry(entry) }
+            if (playlistEntries.isNotEmpty()) {
+                val card = this
+                val requestId = scanSequence
+                val detector = GestureDetector(this@MainActivity, object : GestureDetector.SimpleOnGestureListener() {
+                    override fun onDown(event: MotionEvent) = true
+
+                    override fun onSingleTapConfirmed(event: MotionEvent): Boolean {
+                        if (card.isAttachedToWindow && requestId == scanSequence && isActivityStarted && !isFullscreen) {
+                            card.performClick()
+                        }
+                        return true
+                    }
+
+                    override fun onDoubleTap(event: MotionEvent) = true
+
+                    override fun onDoubleTapEvent(event: MotionEvent): Boolean {
+                        if (event.actionMasked == MotionEvent.ACTION_UP && card.isAttachedToWindow && requestId == scanSequence) {
+                            addDirectoryEntryToPlaylist(entry)
+                        }
+                        return true
+                    }
+                }).apply { setIsLongpressEnabled(false) }
+                setOnTouchListener { _, event ->
+                    detector.onTouchEvent(event)
+                    true
+                }
+                ViewCompat.addAccessibilityAction(this, "加入播放列表") { _, _ ->
+                    addDirectoryEntryToPlaylist(entry)
+                    true
+                }
+            }
         })
     }
 
@@ -1058,7 +1283,7 @@ class MainActivity : Activity() {
                 layoutParams = LinearLayout.LayoutParams(dp(if (compact) 80 else 112), ViewGroup.LayoutParams.MATCH_PARENT)
             }
             row.addView(thumbnail)
-            loadVideoThumbnail(entry, thumbnail)
+            thumbnailLoader.load(entry, thumbnail)
         }
         val textColumn = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1074,13 +1299,13 @@ class MainActivity : Activity() {
             ellipsize = TextUtils.TruncateAt.END
         })
         if (compact) textColumn.addView(TextView(this).apply {
-            text = entry.type.name + if (entry.subtitles.isNotEmpty()) " · 字幕 ${entry.subtitles.size}" else ""
+            text = entry.type.name
             textSize = 11f
             setTextColor(getColor(R.color.player_text_muted))
             setPadding(0, dp(3), 0, 0)
         })
         row.addView(textColumn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
-        if (!compact && entry.subtitles.isNotEmpty()) {
+        if (entry.subtitles.isNotEmpty()) {
             row.addView(TextView(this).apply {
                 text = if (entry.subtitles.size == 1) "字幕" else "字幕 ${entry.subtitles.size}"
                 gravity = Gravity.CENTER
@@ -1113,69 +1338,6 @@ class MainActivity : Activity() {
         radius = dp(6)
     )
 
-    private fun loadVideoThumbnail(entry: MediaEntry, target: ImageView) {
-        val uriKey = entry.uri.toString()
-        val generation = thumbnailGeneration
-        target.tag = uriKey
-        val future = thumbnailExecutor.submit {
-            var thumbnail: Bitmap? = null
-            val retriever = MediaMetadataRetriever()
-            try {
-                retriever.setDataSource(this, entry.uri)
-                val frame = retriever.getFrameAtTime(
-                    1_000_000L,
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-                )
-                if (frame != null) {
-                    thumbnail = centerCropBitmap(frame, dp(240), dp(135))
-                    if (thumbnail !== frame) frame.recycle()
-                }
-            } catch (_: Exception) {
-                // Keep the media placeholder when the source has no readable frame.
-            } finally {
-                try {
-                    retriever.release()
-                } catch (_: RuntimeException) {
-                    // Ignore release failures from malformed media.
-                }
-            }
-            val result = thumbnail ?: return@submit
-            runOnUiThread {
-                if (!isDestroyed && generation == thumbnailGeneration && target.tag == uriKey) {
-                    target.scaleType = ImageView.ScaleType.CENTER_CROP
-                    target.clearColorFilter()
-                    target.setImageBitmap(result)
-                } else {
-                    result.recycle()
-                }
-            }
-        }
-        synchronized(thumbnailFutures) {
-            thumbnailFutures += future
-            thumbnailFutures.removeAll { it.isDone || it.isCancelled }
-        }
-    }
-
-    private fun centerCropBitmap(source: Bitmap, targetWidth: Int, targetHeight: Int): Bitmap {
-        val sourceRatio = source.width.toFloat() / source.height.coerceAtLeast(1)
-        val targetRatio = targetWidth.toFloat() / targetHeight.coerceAtLeast(1)
-        val cropWidth: Int
-        val cropHeight: Int
-        if (sourceRatio > targetRatio) {
-            cropHeight = source.height
-            cropWidth = (source.height * targetRatio).roundToInt().coerceIn(1, source.width)
-        } else {
-            cropWidth = source.width
-            cropHeight = (source.width / targetRatio).roundToInt().coerceIn(1, source.height)
-        }
-        val left = ((source.width - cropWidth) / 2).coerceAtLeast(0)
-        val top = ((source.height - cropHeight) / 2).coerceAtLeast(0)
-        val cropped = Bitmap.createBitmap(source, left, top, cropWidth, cropHeight)
-        val scaled = Bitmap.createScaledBitmap(cropped, targetWidth, targetHeight, true)
-        if (cropped !== scaled && cropped !== source) cropped.recycle()
-        return scaled
-    }
-
     private fun currentPlaybackMode(): PlaybackMode = controller?.let {
         PlaybackMode.fromRepeatMode(it.repeatMode)
     } ?: playbackQueueStore.mode()
@@ -1183,58 +1345,238 @@ class MainActivity : Activity() {
     private fun setPlaybackMode(mode: PlaybackMode) {
         playbackQueueStore.saveMode(mode)
         controller?.repeatMode = mode.repeatMode
+        saveActivePlaylist()
     }
 
     private fun applyPlaybackQueue() {
-        val byUri = loadedEntries.associateBy { it.uri.toString() }
-        activeEntries = PlaybackQueue.resolve(byUri.keys.toList(), queueSelection).map(byUri::getValue)
+        activeEntries = directoryPlaybackEntries ?: playlistEntries.ifEmpty { loadedEntries }
         playbackCoordinator.applyPlaylist(activeEntries)
     }
 
-    private fun savePlaybackQueue(selection: List<String>?, loopEnabled: Boolean, startPlayback: Boolean) {
-        val source = librarySource ?: return
-        queueSelection = selection
-        playbackQueueStore.saveSelection(source, selection)
+    private fun availablePlaylistAdditions(): List<MediaEntry> {
+        val selected = playlistEntries.map { it.uri.toString() }.toSet()
+        return loadedEntries.distinctBy { it.uri.toString() }.filter { it.uri.toString() !in selected }
+    }
+
+    private fun savePlaybackQueue(entries: List<MediaEntry>, refreshLibrary: Boolean = true) {
+        dismissPlaylistUndo()
+        playlistEntries = entries.distinctBy { it.uri.toString() }
+        playbackQueueStore.savePlaylist(playlistEntries)
         applyPlaybackQueue()
-        setPlaybackMode(if (loopEnabled) PlaybackMode.REPEAT_ALL else PlaybackMode.SEQUENTIAL)
-        if (startPlayback && activeEntries.isNotEmpty()) playbackCoordinator.playEntry(0)
         playbackCoordinator.savePosition()
+        saveActivePlaylist()
+        if (refreshLibrary) renderLibrary(refreshDirectory = false)
     }
 
-    private fun showPlaybackQueue() {
-        if (isLibraryLoading || loadedEntries.isEmpty() || controller == null) return
-        PlaybackQueueDialog(
-            activity = this,
-            available = loadedEntries,
-            savedSelection = queueSelection,
-            currentUri = controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
-            loopEnabled = currentPlaybackMode() == PlaybackMode.REPEAT_ALL,
-            createPreview = { entry, label -> createMediaPreview(entry, label, maxLines = 2, compact = true) },
-            onSave = ::savePlaybackQueue
-        ).show()
+    private fun showAddMedia() {
+        val candidates = availablePlaylistAdditions()
+        if (controller == null || candidates.isEmpty()) return
+        val checked = BooleanArray(candidates.size)
+        val choices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val checks = mutableListOf<CheckBox>()
+        val scroll = dialogScroll(choices)
+        val picker = AlertDialog.Builder(this)
+            .setTitle(if (hasPlaylistSection()) "添加媒体" else "创建播放列表")
+            .setView(scroll)
+            .setNegativeButton("取消", null)
+            .setNeutralButton("全选", null)
+            .setPositiveButton("添加") { _, _ ->
+                val additions = candidates.filterIndexed { index, _ -> checked[index] }
+                if (additions.isNotEmpty()) {
+                    playlistCollapsed = false
+                    savePlaybackQueue(playlistEntries + additions)
+                }
+            }.create()
+        candidates.forEachIndexed { index, entry ->
+            val check = CheckBox(this).apply {
+                contentDescription = "添加 ${entry.name}"
+                setOnCheckedChangeListener { _, selected ->
+                    checked[index] = selected
+                    picker.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = checked.any { it }
+                    picker.getButton(AlertDialog.BUTTON_NEUTRAL)?.text = if (checked.all { it }) "全不选" else "全选"
+                }
+            }
+            checks += check
+            choices.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(check, LinearLayout.LayoutParams(dp(48), dp(72)))
+                addView(createMediaPreview(entry, maxLines = 2, compact = true),
+                    LinearLayout.LayoutParams(0, dp(72), 1f))
+                isFocusable = true
+                setOnClickListener { check.toggle() }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(80)))
+        }
+        picker.show()
+        picker.window?.setLayout(minOf(resources.displayMetrics.widthPixels - dp(24), dp(560)),
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        scroll.layoutParams.height = minOf(dp(80) * candidates.size,
+            (resources.displayMetrics.heightPixels * 0.7f - dp(140)).toInt().coerceAtLeast(dp(80)))
+        scroll.requestLayout()
+        picker.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
+        picker.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+            val selectAll = !checked.all { it }
+            checks.forEach { it.isChecked = selectAll }
+        }
     }
 
-    private fun playLibraryEntry(entry: MediaEntry) {
+    private fun playDirectoryEntry(entry: MediaEntry) {
         if (controller == null) {
             Toast.makeText(this, "播放器正在连接，请稍后重试", Toast.LENGTH_SHORT).show()
             return
         }
-        val index = activeEntries.indexOfFirst { it.uri == entry.uri }
-        if (index >= 0) {
-            playbackCoordinator.playEntry(index)
+        val directory = loadedEntries.takeIf { playlistEntries.isNotEmpty() }
+        if (directoryPlaybackEntries != directory) {
+            directoryPlaybackEntries = directory
+            playbackQueueStore.saveDirectoryPlayback(directory)
+        }
+        applyPlaybackQueue()
+        playbackCoordinator.playEntry(activeEntries.indexOfFirst { it.uri == entry.uri })
+    }
+
+    private fun playPlaylistEntry(entry: MediaEntry) {
+        if (controller == null) {
+            Toast.makeText(this, "播放器正在连接，请稍后重试", Toast.LENGTH_SHORT).show()
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle(entry.name)
-            .setItems(arrayOf("加入循环列表并播放", "使用全部媒体播放")) { _, choice ->
-                val selection = if (choice == 0) {
-                    (queueSelection.orEmpty() + entry.uri.toString()).distinct()
-                } else null
-                savePlaybackQueue(selection, currentPlaybackMode() == PlaybackMode.REPEAT_ALL, startPlayback = false)
-                playbackCoordinator.playEntry(activeEntries.indexOfFirst { it.uri == entry.uri })
+        directoryPlaybackEntries = null
+        playbackQueueStore.saveDirectoryPlayback(null)
+        applyPlaybackQueue()
+        playbackCoordinator.playEntry(activeEntries.indexOfFirst { it.uri == entry.uri })
+    }
+
+    private fun addDirectoryEntryToPlaylist(entry: MediaEntry) {
+        if (playlistEntries.isEmpty()) return
+        if (playlistEntries.any { it.uri == entry.uri }) {
+            Toast.makeText(this, "已在播放列表中", Toast.LENGTH_SHORT).show()
+            return
+        }
+        savePlaybackQueue(playlistEntries + entry)
+        Toast.makeText(this, "已加入播放列表", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun createPlaylistMenuButton(): View {
+        return quietIcon(R.drawable.ic_more_vert, "更多歌单操作") {}.apply {
+            setOnClickListener { anchor ->
+                PopupMenu(this@MainActivity, anchor).apply {
+                    menu.add(if (playbackQueueStore.activePlaylistId() == null) "保存为歌单" else "另存为新歌单")
+                        .setOnMenuItemClickListener { showSavePlaylist(); true }
+                    show()
+                }
             }
+        }
+    }
+
+    private fun saveActivePlaylist() {
+        playbackQueueStore.activePlaylistId()?.let { id ->
+            playbackQueueStore.updatePlaylist(id, playlistEntries, currentPlaybackMode())
+        }
+    }
+
+    private fun clearCurrentPlaylist() {
+        val previous = ClearedPlaylist(playlistEntries.toList(), directoryPlaybackEntries == null,
+            playbackQueueStore.activePlaylistId())
+        if (previous.resumePlaylist) {
+            val currentUri = controller?.currentMediaItem?.localConfiguration?.uri
+            directoryPlaybackEntries = activeEntries.firstOrNull { it.uri == currentUri }?.let(::listOf)
+            playbackQueueStore.saveDirectoryPlayback(directoryPlaybackEntries)
+        }
+        // Clearing the queue does not empty or delete the saved playlist.
+        playbackQueueStore.setActivePlaylistId(null)
+        savePlaybackQueue(emptyList(), refreshLibrary = false)
+        clearedPlaylist = previous
+        mainHandler.postDelayed(playlistUndoTimeout, PLAYLIST_UNDO_TIMEOUT_MS)
+        renderLibrary(refreshDirectory = false)
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        val pending = clearedPlaylist
+        val handled = super.dispatchTouchEvent(event)
+        // Let any queued click run first, including an Undo tapped on the third interaction.
+        if (event.actionMasked == MotionEvent.ACTION_UP && pending != null) {
+            mainHandler.post {
+                if (clearedPlaylist === pending) {
+                    playlistUndoInteractions++
+                    if (playlistUndoInteractions >= PLAYLIST_UNDO_MAX_INTERACTIONS) dismissPlaylistUndo(animate = true)
+                }
+            }
+        }
+        return handled
+    }
+
+    private fun dismissPlaylistUndo(animate: Boolean = false) {
+        mainHandler.removeCallbacks(playlistUndoTimeout)
+        clearedPlaylist = null
+        playlistUndoInteractions = 0
+        val row = playlistUndoRow ?: return
+        playlistUndoRow = null
+        row.animate().cancel()
+        if (animate) {
+            row.animate().alpha(0f).setDuration(180L).withEndAction {
+                (row.parent as? ViewGroup)?.removeView(row)
+            }.start()
+        } else {
+            (row.parent as? ViewGroup)?.removeView(row)
+        }
+    }
+
+    private fun showSavePlaylist() {
+        val names = playbackQueueStore.savedPlaylists().map { it.name }.toSet()
+        val number = generateSequence(1) { it + 1 }.first { "歌单 $it" !in names }
+        val input = EditText(this).apply {
+            setSingleLine(true)
+            hint = "歌单名称"
+            contentDescription = "歌单名称"
+            setText("歌单 $number")
+            selectAll()
+        }
+        val panel = LinearLayout(this).apply {
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)))
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("新建歌单")
+            .setMessage(if (playlistEntries.isEmpty()) "创建后可从当前目录添加媒体。" else "包含当前播放列表，之后的调整会自动保存。")
+            .setView(panel)
             .setNegativeButton("取消", null)
-            .show()
+            .setPositiveButton("创建", null)
+            .create()
+        dialog.show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            val name = input.text.toString().trim()
+            if (name.isBlank()) input.error = "请输入歌单名称"
+            else playbackQueueStore.createPlaylist(name, playlistEntries, currentPlaybackMode())?.let { saved ->
+                dismissPlaylistUndo()
+                playbackQueueStore.setActivePlaylistId(saved.id)
+                renderLibrary(refreshDirectory = false)
+                Toast.makeText(this, "歌单已创建，后续调整自动保存", Toast.LENGTH_SHORT).show()
+                dialog.dismiss()
+            }
+        }
+        input.requestFocus()
+        dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+    }
+
+    private fun openSavedPlaylist(playlist: SavedPlaylist) {
+        // Detach the previous identity before changing mode, so it cannot be overwritten.
+        playbackQueueStore.setActivePlaylistId(null)
+        directoryPlaybackEntries = null
+        playbackQueueStore.saveDirectoryPlayback(null)
+        playlistCollapsed = false
+        setPlaybackMode(playlist.mode)
+        playbackQueueStore.setActivePlaylistId(playlist.id)
+        savePlaybackQueue(playlist.entries)
+    }
+
+    private fun showSavedPlaylists() {
+        SavedPlaylistsDialog(
+            activity = this,
+            store = playbackQueueStore,
+            activeId = { playbackQueueStore.activePlaylistId() },
+            onOpen = ::openSavedPlaylist,
+            onCreate = ::showSavePlaylist,
+            onChanged = { renderLibrary(refreshDirectory = false) }
+        ).show()
     }
 
     private fun showTimerMenu(anchor: android.view.View) {
@@ -1353,10 +1695,6 @@ class MainActivity : Activity() {
 
     private fun showPlayerSettingsMenu(anchor: View) {
         PopupMenu(this, anchor).apply {
-            menu.add("循环列表 · ${activeEntries.size} 项 · ${if (currentPlaybackMode() == PlaybackMode.REPEAT_ALL) "已开启" else "未开启"}").apply {
-                isEnabled = !isLibraryLoading && loadedEntries.isNotEmpty() && controller != null
-                setOnMenuItemClickListener { showPlaybackQueue(); true }
-            }
             menu.addSubMenu("画面设置").apply {
                 add("适配画面").setOnMenuItemClickListener {
                     setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
@@ -1629,6 +1967,19 @@ class MainActivity : Activity() {
         playerView?.scaleY = 1f
     }
 
+    private fun normalPlayerHeight(): Int =
+        dp(minOf(235, resources.configuration.screenHeightDp * 2 / 5))
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (!isFullscreen) {
+            playerView?.apply {
+                layoutParams.height = normalPlayerHeight()
+                requestLayout()
+            }
+        }
+    }
+
     private fun setFullscreen(fullscreen: Boolean) {
         if (isFullscreen == fullscreen) return
         isFullscreen = fullscreen
@@ -1661,7 +2012,7 @@ class MainActivity : Activity() {
             root.setPadding(dp(12), dp(10), dp(12), dp(12))
             video.layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(235)
+                normalPlayerHeight()
             )
             requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             WindowInsetsControllerCompat(window, window.decorView)
@@ -1921,16 +2272,13 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         playbackCoordinator.savePosition()
+        dismissPlaylistUndo()
         mainHandler.removeCallbacks(progressTicker)
         playerView?.keepScreenOn = false
         volumePopup?.dismiss()
         scanFuture?.cancel(true)
-        synchronized(thumbnailFutures) {
-            thumbnailFutures.forEach { it.cancel(true) }
-            thumbnailFutures.clear()
-        }
+        thumbnailLoader.close()
         scanExecutor.shutdownNow()
-        thumbnailExecutor.shutdownNow()
         controller?.release()
         controllerFuture?.cancel(true)
         super.onDestroy()
@@ -2000,19 +2348,19 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             minHeight = 0
             minimumHeight = 0
-            minWidth = 0
-            minimumWidth = 0
-            setPadding(dp(10), 0, dp(10), 0)
+            minWidth = dp(48)
+            minimumWidth = dp(48)
+            setPadding(dp(8), 0, dp(8), 0)
             setCompoundDrawablesRelativeWithIntrinsicBounds(iconRes, 0, 0, 0)
-            compoundDrawablePadding = dp(6)
+            compoundDrawablePadding = dp(4)
             contentDescription = description
             background = toolbarButtonBackground(selected)
             stateListAnimator = null
             elevation = 0f
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                dp(40)
-            ).apply { marginStart = dp(6) }
+                dp(48)
+            ).apply { marginStart = dp(4) }
             setOnClickListener(action)
         }
 
@@ -2060,7 +2408,7 @@ class MainActivity : Activity() {
                 scrubDuration = player?.duration?.coerceAtLeast(0L) ?: 0L
                 scrubSnapper = if (snapSeekToCueStarts && player != null) {
                     val currentUri = player.currentMediaItem?.localConfiguration?.uri?.toString()
-                    val cueStarts = loadedEntries
+                    val cueStarts = activeEntries
                         .firstOrNull { it.uri.toString() == currentUri }
                         ?.subtitles
                         ?.flatMap { it.cueStartTimesMs }

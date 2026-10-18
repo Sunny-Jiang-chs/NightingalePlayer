@@ -25,8 +25,42 @@ internal class PlaybackCoordinator(private val stateStore: PlaybackStateStore) {
             mediaItems.indices.all { player.getMediaItemAt(it) == mediaItems[it] }
         ) return
         val currentUri = player.currentMediaItem?.localConfiguration?.uri?.toString()
+        val uris = entries.map { it.uri.toString() }
+        val queuedItems = (0 until player.mediaItemCount).map(player::getMediaItemAt).toMutableList()
+        val queuedUris = queuedItems.mapNotNull { it.localConfiguration?.uri?.toString() }
+        if (currentUri != null && currentUri in uris && queuedUris.size == queuedItems.size &&
+            queuedUris.distinct().size == queuedUris.size && uris.distinct().size == uris.size
+        ) {
+            // Keep the current media source and its position when only the queue changes.
+            val retainedUris = uris.toSet()
+            for (index in queuedItems.indices.reversed()) {
+                if (queuedUris[index] !in retainedUris) {
+                    player.removeMediaItem(index)
+                    queuedItems.removeAt(index)
+                }
+            }
+            mediaItems.forEachIndexed { targetIndex, mediaItem ->
+                val fromIndex = queuedItems.indexOfFirst {
+                    it.localConfiguration?.uri?.toString() == uris[targetIndex]
+                }
+                if (fromIndex < 0) {
+                    player.addMediaItem(targetIndex, mediaItem)
+                    queuedItems.add(targetIndex, mediaItem)
+                } else {
+                    if (fromIndex != targetIndex) {
+                        player.moveMediaItem(fromIndex, targetIndex)
+                        queuedItems.add(targetIndex, queuedItems.removeAt(fromIndex))
+                    }
+                    if (queuedItems[targetIndex] != mediaItem) {
+                        player.replaceMediaItem(targetIndex, mediaItem)
+                        queuedItems[targetIndex] = mediaItem
+                    }
+                }
+            }
+            return
+        }
         val resume = resolvePlaylistResume(
-            uris = entries.map { it.uri.toString() },
+            uris = uris,
             currentUri = currentUri,
             currentPositionMs = player.currentPosition,
             currentPlaying = player.playWhenReady,
