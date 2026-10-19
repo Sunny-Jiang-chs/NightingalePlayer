@@ -11,8 +11,8 @@ android {
         applicationId = "com.myp.sleepplayer"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "4.0"
+        versionCode = 12
+        versionName = "0.4"
     }
 
     buildTypes {

@@ -3,6 +3,9 @@ package com.myp.sleepplayer
 import android.app.Activity
 import android.content.res.ColorStateList
 import android.content.res.Configuration
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.os.Bundle
@@ -12,6 +15,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
@@ -70,6 +74,12 @@ internal class PlaybackQueueView(
         clipToPadding = false
         setPadding(dp(2), dp(2), dp(2), dp(2))
     }
+    private val scrollRail = ScrollRail()
+    private val viewport = LinearLayout(activity).apply {
+        orientation = HORIZONTAL
+        addView(rows, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+        addView(scrollRail, LinearLayout.LayoutParams(dp(48), ViewGroup.LayoutParams.MATCH_PARENT))
+    }
     private val dragHelper = ItemTouchHelper(object : ItemTouchHelper.SimpleCallback(
         ItemTouchHelper.UP or ItemTouchHelper.DOWN, 0
     ) {
@@ -115,15 +125,19 @@ internal class PlaybackQueueView(
             addView(modeHint, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(addMediaAction)
         })
-        addView(rows, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, viewportHeight()))
+        addView(viewport, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, viewportHeight()))
+        rows.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> updateScrollRail() }
+        rows.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) = updateScrollRail()
+        })
         updateModeHint()
         dragHelper.attachToRecyclerView(rows)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        rows.layoutParams.height = viewportHeight()
-        rows.requestLayout()
+        viewport.layoutParams.height = viewportHeight()
+        viewport.requestLayout()
     }
 
     fun updateCurrentUri(uri: String?) {
@@ -155,9 +169,96 @@ internal class PlaybackQueueView(
         items.removeAt(position)
         adapter.notifyItemRemoved(position)
         adapter.notifyItemRangeChanged(position, items.size - position, true)
-        rows.layoutParams.height = viewportHeight()
-        rows.requestLayout()
+        viewport.layoutParams.height = viewportHeight()
+        viewport.requestLayout()
         onChange(items.toList())
+    }
+
+    private fun updateScrollRail() {
+        scrollRail.visibility = if (rows.canScrollVertically(-1) || rows.canScrollVertically(1)) View.VISIBLE else View.GONE
+        scrollRail.invalidate()
+    }
+
+    /** A separate touch lane browses the list without starting a card reorder. */
+    private inner class ScrollRail : View(activity) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val thumb = RectF()
+        private var grabOffset = 0f
+
+        init {
+            contentDescription = "滚动浏览播放列表"
+            isFocusable = true
+            isClickable = true
+        }
+
+        private fun updateThumb() {
+            val trackHeight = (height - dp(16)).coerceAtLeast(1).toFloat()
+            val range = rows.computeVerticalScrollRange().coerceAtLeast(1)
+            val extent = rows.computeVerticalScrollExtent()
+            val thumbHeight = (trackHeight * extent / range).coerceIn(dp(48).toFloat().coerceAtMost(trackHeight), trackHeight)
+            val fraction = rows.computeVerticalScrollOffset().toFloat() / (range - extent).coerceAtLeast(1)
+            val top = dp(8) + (trackHeight - thumbHeight) * fraction.coerceIn(0f, 1f)
+            thumb.set(width / 2f - dp(4), top, width / 2f + dp(4), top + thumbHeight)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            updateThumb()
+            paint.color = activity.getColor(R.color.player_border)
+            canvas.drawRoundRect(width / 2f - dp(1), dp(8).toFloat(), width / 2f + dp(1), height - dp(8).toFloat(), dp(1).toFloat(), dp(1).toFloat(), paint)
+            paint.color = activity.getColor(if (isPressed) R.color.player_accent else R.color.player_text_muted)
+            canvas.drawRoundRect(thumb, dp(4).toFloat(), dp(4).toFloat(), paint)
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    rows.stopScroll()
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                    isPressed = true
+                    updateThumb()
+                    grabOffset = if (event.y in thumb.top..thumb.bottom) event.y - thumb.top else thumb.height() / 2f
+                    scrollToTouch(event.y)
+                }
+                MotionEvent.ACTION_MOVE -> scrollToTouch(event.y)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    isPressed = false
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    if (event.actionMasked == MotionEvent.ACTION_UP) performClick()
+                    invalidate()
+                }
+            }
+            return true
+        }
+
+        private fun scrollToTouch(y: Float) {
+            val travel = height - dp(16) - thumb.height()
+            if (travel <= 0) return
+            val fraction = ((y - dp(8) - grabOffset) / travel).coerceIn(0f, 1f)
+            val maxScroll = (rows.computeVerticalScrollRange() - rows.computeVerticalScrollExtent()).coerceAtLeast(0)
+            rows.scrollBy(0, (maxScroll * fraction).roundToInt() - rows.computeVerticalScrollOffset())
+        }
+
+        override fun performClick(): Boolean {
+            super.performClick()
+            return true
+        }
+
+        override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+            super.onInitializeAccessibilityNodeInfo(info)
+            info.className = "android.widget.ScrollView"
+            info.isScrollable = true
+            if (rows.canScrollVertically(-1)) info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_BACKWARD)
+            if (rows.canScrollVertically(1)) info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_FORWARD)
+        }
+
+        override fun performAccessibilityAction(action: Int, arguments: Bundle?): Boolean {
+            if (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD || action == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) {
+                rows.smoothScrollBy(0, rows.height * if (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) 1 else -1)
+                return true
+            }
+            return super.performAccessibilityAction(action, arguments)
+        }
     }
 
     private fun move(from: Int, to: Int) {

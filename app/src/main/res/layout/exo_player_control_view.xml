@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <merge xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Keep the three actions visible instead of moving them into an overflow menu. -->
+    <!-- Keep player actions visible; the fullscreen-only episode picker is inserted in code. -->
     <LinearLayout
         android:id="@id/exo_bottom_bar"
         android:layout_width="match_parent"

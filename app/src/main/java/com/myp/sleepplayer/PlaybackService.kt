@@ -16,6 +16,7 @@ import androidx.media3.common.C
 import androidx.media3.common.text.Cue
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
@@ -85,6 +86,17 @@ class PlaybackService : MediaSessionService() {
         gainDb = playbackControlStore.gainDb()
         applySubtitleSettings(subtitlePreferencesStore.read(Color.WHITE))
         player = ExoPlayer.Builder(this)
+            // Local files do not need the default multi-second start/rebuffer gate.
+            // Keep forward buffering, and retain recent samples for nearby rewinds.
+            .setLoadControl(DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                    DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                    DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
+                    100,
+                    250
+                )
+                .setBackBuffer(15_000, true)
+                .build())
             // Exact seek decodes forward from the previous keyframe instead of
             // snapping to a distant sync point in low-frame-rate files.
             .setSeekParameters(SeekParameters.EXACT)

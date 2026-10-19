@@ -209,6 +209,7 @@ class MainActivity : Activity() {
         private const val MAX_TIMER_MINUTES = 24 * 60
         private const val PLAYLIST_UNDO_TIMEOUT_MS = 10_000L
         private const val PLAYLIST_UNDO_MAX_INTERACTIONS = 3
+        private const val BUFFERING_INDICATOR_DELAY_MS = 400L
     }
 
     private val scanExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -228,6 +229,8 @@ class MainActivity : Activity() {
     private var playbackButton: ImageButton? = null
     private var speakerButton: ImageButton? = null
     private var volumePopup: PopupWindow? = null
+    private var episodesButton: TextView? = null
+    private var episodesPopup: FullscreenEpisodesPopup? = null
     private var scrubOverlayView: TextView? = null
     private var subtitleButton: Button? = null
     private var loadedEntries: List<MediaEntry> = emptyList()
@@ -245,7 +248,6 @@ class MainActivity : Activity() {
     private var playlistLoopCheck: CheckBox? = null
     private var playlistAddButton: Button? = null
     private var directorySectionView: LinearLayout? = null
-    private var directoryShowsPlaylistGestures = false
     private var directoryHasPlaylistSection = false
     private var playlistCollapsed = false
     private var directoryCollapsed = false
@@ -290,6 +292,12 @@ class MainActivity : Activity() {
     private var scrubSnapper: SubtitleSeekSnapper? = null
     private var scrubWasSnapped = false
     private var scaleDetector: ScaleGestureDetector? = null
+
+    private val showBufferingIndicator = Runnable {
+        if (controller?.playbackState == Player.STATE_BUFFERING && controller?.playWhenReady == true) {
+            playerView?.setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+        }
+    }
 
     private val longPressSpeedBoostRunnable = Runnable {
         if (touchGestureActive &&
@@ -418,7 +426,7 @@ class MainActivity : Activity() {
             }
         }.apply {
             resizeMode = currentResizeMode
-            setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+            setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
             setKeepContentOnPlayerReset(true)
             useController = true
             controllerShowTimeoutMs = 5_000
@@ -535,6 +543,7 @@ class MainActivity : Activity() {
                 attachPlaybackButtonToPlayerControls()
                 attachSpeakerButtonToPlayerControls()
                 attachSettingsButtonToPlayerControls()
+                attachEpisodesButtonToPlayerControls()
                 stylePlayerControls()
                 controller?.volume = if (isMuted) 0f else lastVolume
                 updateSpeakerButton()
@@ -553,10 +562,12 @@ class MainActivity : Activity() {
 
                     override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
                         updatePlaybackButton()
+                        updateBufferingIndicator()
                     }
 
                     override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
                         updatePlaylistHighlight()
+                        episodesPopup?.updateCurrent(mediaItem?.localConfiguration?.uri?.toString())
                     }
 
                     override fun onRepeatModeChanged(repeatMode: Int) {
@@ -565,6 +576,7 @@ class MainActivity : Activity() {
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
                         updatePlaybackButton()
+                        updateBufferingIndicator()
                     }
 
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -938,7 +950,6 @@ class MainActivity : Activity() {
         playlistUndoRow?.animate()?.cancel()
         playlistUndoRow = null
         val keepDirectory = !refreshDirectory && directorySectionView != null &&
-            directoryShowsPlaylistGestures == playlistEntries.isNotEmpty() &&
             directoryHasPlaylistSection == hasPlaylistSection()
         val directory = directorySectionView.takeIf { keepDirectory }
         // Playlist edits only replace their own section; keep all directory cards.
@@ -1031,7 +1042,6 @@ class MainActivity : Activity() {
         }
         if (!keepDirectory) {
             directorySectionView = createDirectorySection().also { container.addView(it) }
-            directoryShowsPlaylistGestures = playlistEntries.isNotEmpty()
             directoryHasPlaylistSection = hasPlaylistSection()
         }
         updatePlaylistAddButton()
@@ -1228,7 +1238,7 @@ class MainActivity : Activity() {
             isFocusable = true
             contentDescription = "${entry.name}，播放"
             setOnClickListener { playDirectoryEntry(entry) }
-            if (playlistEntries.isNotEmpty()) {
+            if (hasPlaylistSection()) {
                 val card = this
                 val requestId = scanSequence
                 val detector = GestureDetector(this@MainActivity, object : GestureDetector.SimpleOnGestureListener() {
@@ -1349,7 +1359,9 @@ class MainActivity : Activity() {
     }
 
     private fun applyPlaybackQueue() {
-        activeEntries = directoryPlaybackEntries ?: playlistEntries.ifEmpty { loadedEntries }
+        val entries = directoryPlaybackEntries ?: playlistEntries.ifEmpty { loadedEntries }
+        if (activeEntries != entries) episodesPopup?.dismiss()
+        activeEntries = entries
         playbackCoordinator.applyPlaylist(activeEntries)
     }
 
@@ -1384,7 +1396,7 @@ class MainActivity : Activity() {
                 val additions = candidates.filterIndexed { index, _ -> checked[index] }
                 if (additions.isNotEmpty()) {
                     playlistCollapsed = false
-                    savePlaybackQueue(playlistEntries + additions)
+                    appendToPlaylist(additions)
                 }
             }.create()
         candidates.forEachIndexed { index, entry ->
@@ -1425,7 +1437,7 @@ class MainActivity : Activity() {
             Toast.makeText(this, "播放器正在连接，请稍后重试", Toast.LENGTH_SHORT).show()
             return
         }
-        val directory = loadedEntries.takeIf { playlistEntries.isNotEmpty() }
+        val directory = loadedEntries.takeIf { hasPlaylistSection() }
         if (directoryPlaybackEntries != directory) {
             directoryPlaybackEntries = directory
             playbackQueueStore.saveDirectoryPlayback(directory)
@@ -1446,13 +1458,23 @@ class MainActivity : Activity() {
     }
 
     private fun addDirectoryEntryToPlaylist(entry: MediaEntry) {
-        if (playlistEntries.isEmpty()) return
+        if (!hasPlaylistSection()) return
         if (playlistEntries.any { it.uri == entry.uri }) {
             Toast.makeText(this, "已在播放列表中", Toast.LENGTH_SHORT).show()
             return
         }
-        savePlaybackQueue(playlistEntries + entry)
+        appendToPlaylist(listOf(entry))
         Toast.makeText(this, "已加入播放列表", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun appendToPlaylist(entries: List<MediaEntry>) {
+        // An empty playlist currently falls back to directory playback. Keep that
+        // queue when adding its first item, just as when adding later items.
+        if (playlistEntries.isEmpty() && directoryPlaybackEntries == null && activeEntries.isNotEmpty()) {
+            directoryPlaybackEntries = activeEntries
+            playbackQueueStore.saveDirectoryPlayback(directoryPlaybackEntries)
+        }
+        savePlaybackQueue(playlistEntries + entries)
     }
 
     private fun createPlaylistMenuButton(): View {
@@ -1972,6 +1994,7 @@ class MainActivity : Activity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        episodesPopup?.dismiss()
         if (!isFullscreen) {
             playerView?.apply {
                 layoutParams.height = normalPlayerHeight()
@@ -1987,6 +2010,8 @@ class MainActivity : Activity() {
         val video = playerView ?: return
         video.setFullscreenButtonState(fullscreen)
         volumePopup?.dismiss()
+        episodesPopup?.dismiss()
+        episodesButton?.visibility = if (fullscreen) View.VISIBLE else View.GONE
         if (fullscreen) {
             for (index in 0 until root.childCount) {
                 val child = root.getChildAt(index)
@@ -2052,6 +2077,15 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun updateBufferingIndicator() {
+        mainHandler.removeCallbacks(showBufferingIndicator)
+        playerView?.setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
+        if (controller?.playbackState == Player.STATE_BUFFERING && controller?.playWhenReady == true) {
+            // Brief local seeks should not flash a loading wheel; longer waits stay visible.
+            mainHandler.postDelayed(showBufferingIndicator, BUFFERING_INDICATOR_DELAY_MS)
+        }
+    }
+
     private fun stylePlayerControls() {
         val video = playerView ?: return
         video.findViewById<View>(androidx.media3.ui.R.id.exo_center_controls)?.visibility = View.GONE
@@ -2112,6 +2146,48 @@ class MainActivity : Activity() {
         ) ?: return
         settingsButton.contentDescription = "播放器设置"
         settingsButton.setOnClickListener { showPlayerSettingsMenu(settingsButton) }
+    }
+
+    private fun attachEpisodesButtonToPlayerControls() {
+        if (episodesButton != null) return
+        val settings = playerView?.findViewById<View>(androidx.media3.ui.R.id.exo_settings) ?: return
+        val controls = settings.parent as? ViewGroup ?: return
+        episodesButton = TextView(this).apply {
+            text = "选集"
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            isFocusable = true
+            contentDescription = "选集"
+            tooltipText = "选集"
+            val selectable = TypedValue()
+            theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, selectable, true)
+            setBackgroundResource(selectable.resourceId)
+            visibility = if (isFullscreen) View.VISIBLE else View.GONE
+            setOnClickListener { showFullscreenEpisodes() }
+        }.also {
+            controls.addView(it, controls.indexOfChild(settings), ViewGroup.LayoutParams(settings.layoutParams))
+        }
+    }
+
+    private fun showFullscreenEpisodes() {
+        val video = playerView ?: return
+        if (!isFullscreen || video.width == 0 || video.height == 0) return
+        volumePopup?.dismiss()
+        episodesPopup?.dismiss()
+        episodesPopup = FullscreenEpisodesPopup(
+            this,
+            activeEntries.toList(),
+            controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
+            createPreview = { createMediaPreview(it, maxLines = 2, compact = true) },
+            onPlay = { playbackCoordinator.playEntry(it) }
+        ).also { picker ->
+            picker.show(video) {
+                episodesPopup = null
+                episodesButton?.requestFocus()
+                video.showController()
+            }
+        }
     }
 
     private fun showVolumePopup(anchor: View) {
@@ -2274,8 +2350,10 @@ class MainActivity : Activity() {
         playbackCoordinator.savePosition()
         dismissPlaylistUndo()
         mainHandler.removeCallbacks(progressTicker)
+        mainHandler.removeCallbacks(showBufferingIndicator)
         playerView?.keepScreenOn = false
         volumePopup?.dismiss()
+        episodesPopup?.dismiss()
         scanFuture?.cancel(true)
         thumbnailLoader.close()
         scanExecutor.shutdownNow()
