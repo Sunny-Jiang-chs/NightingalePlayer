@@ -25,12 +25,13 @@
 
 面向助眠场景的 Android 本地媒体播放器，支持 MP4、MP3、WAV，外挂 WebVTT 字幕和 LRC 歌词。
 
-当前源码版本由 `app/build.gradle.kts` 定义：`versionName = "0.4"`、`versionCode = 12`，最低 Android 8.0（API 26）。内部包名/applicationId `com.myp.sleepplayer`、项目目录 `NightingalePlayer`、已有偏好文件和模拟器媒体目录 `SleepVideoPlayer` 保持兼容，不随对外名称更改。已有 APK 可能来自较早的构建，不能仅凭文件名认定与当前源码一致。
+当前源码版本由 `app/build.gradle.kts` 定义：`versionName = "0.5"`、`versionCode = 13`，最低 Android 8.0（API 26）。内部包名/applicationId `com.myp.sleepplayer`、项目目录 `NightingalePlayer`、已有偏好文件和模拟器媒体目录 `SleepVideoPlayer` 保持兼容，不随对外名称更改。已有 APK 可能来自较早的构建，不能仅凭文件名认定与当前源码一致。
 
 ## 已实现
 
 - 精确 seek：使用 Media3 `SeekParameters.EXACT`，低帧率视频会从前一关键帧解码到目标位置；在视频画面上左右滑动可快进或回退，距离越长跳转越远。
 - 本地跳转：起播/跳转后的缓冲门槛设为 100 ms、重新缓冲门槛为 250 ms，并保留最近 15 秒及其前一关键帧的样本，减少短距离回退的重复读取；短暂等待不闪加载图标，持续等待超过 400 ms 才显示。继续保留精确落点和字幕对齐；关键帧间隔较长的视频仍需要补解码，实际恢复速度取决于视频编码和设备。
+- 跳转优化实验：H.264 精确跳转时，仅跳过目标至少一秒之前、可确认不会被其他画面引用的普通非参考帧；保留参考帧、目标附近、片尾、加密与无法确认的样本，其他编码沿用 Media3 原有路径。正在播放且选中音轨时，可在 Media3 有界等待窗口内先恢复音频，让视频追上同一播放时钟；暂停跳转仍等待目标画面并保持暂停。压缩数据预读目标约一分钟，使用 64 MiB 加载目标优先限制继续读取，实际预读时长随码率和保留的回退数据变化。这些处理不重编码、不修改原媒体，也不保证全部 MP4 零等待。
 - 自动字幕：同目录匹配 `video.vtt`、`video.wav.vtt`、`video.zh.vtt` 等文件；同名 `.lrc` 歌词（含 `[offset:]` 与一行多时间戳）会自动转成 WebVTT 使用。
 - 字幕定位：可在“字幕设置”启用“有字幕时，滑动对齐字幕起始点”；横向拖动会将目标位置吸附到当前媒体匹配到的 VTT/LRC cue 起点，关闭时保持连续 seek。
 - 画面控制：播放器控制栏提供全屏和设置入口；设置菜单可调整画面适配、裁剪、拉伸、双指缩放、倍速、增益、定时和字幕，全屏时也可使用。
@@ -62,6 +63,8 @@ com.myp.sleepplayer
 │   ├── MediaScanner.kt         File 与 SAF 目录扫描、字幕匹配、LRC 转 VTT 与缓存
 │   └── SubtitleSupport.kt      LRC 时间戳解析和 WebVTT 时间格式化
 └── playback/
+    ├── LocalRenderersFactory.kt 本地跳转渲染器、非参考帧跳过与音频先恢复
+    ├── H264SampleDependencies.kt 保守识别 Annex B 非参考画面
     ├── PlaybackCoordinator.kt  播放列表装载、恢复决策和条目播放
     ├── PlaybackQueue.kt        循环模式、选曲/顺序与恢复决策
     ├── PlaybackQueueStore.kt   循环模式、跨目录列表、命名歌单和目录播放队列的持久化
@@ -144,9 +147,10 @@ APK 输出在 `app\build\outputs\apk\debug\app-debug.apk`。这是只构建入�
 ```powershell
 .\gradlew.bat --console=plain :app:verifySubtitleSupport
 .\gradlew.bat --console=plain :app:verifyPlaybackQueue
+.\gradlew.bat --console=plain :app:verifyH264Dependencies
 ```
 
-它们会编译相关测试类并执行 JVM 检查，仍会写构建与依赖缓存。播放列表检查覆盖选曲、排序、缺失文件、无效移动和进度恢复；通过不代表设备上的播放、手势、后台服务或权限交互已经验收。
+它们会编译相关测试类并执行 JVM 检查，仍会写构建与依赖缓存。播放列表检查覆盖选曲、排序、缺失文件、无效移动和进度恢复；H.264 检查覆盖参考帧与多 slice 判断、未知与截断 NAL 回退、起始码和缓冲区位置保持。通过不代表设备上的播放、手势、后台服务或权限交互已经验收。
 
 构建发布包：
 

@@ -21,6 +21,7 @@ import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.myp.sleepplayer.playback.PlaybackControlStore
+import com.myp.sleepplayer.playback.LocalRenderersFactory
 import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
 import com.myp.sleepplayer.playback.PlaybackMode
 import com.myp.sleepplayer.playback.PlaybackQueueStore
@@ -85,16 +86,19 @@ class PlaybackService : MediaSessionService() {
         super.onCreate()
         gainDb = playbackControlStore.gainDb()
         applySubtitleSettings(subtitlePreferencesStore.read(Color.WHITE))
-        player = ExoPlayer.Builder(this)
+        val renderersFactory = LocalRenderersFactory(this)
+        player = ExoPlayer.Builder(this, renderersFactory)
             // Local files do not need the default multi-second start/rebuffer gate.
-            // Keep forward buffering, and retain recent samples for nearby rewinds.
+            // Aim for a minute of compressed lookahead, with a 64 MiB loading target taking
+            // precedence over duration. This does not predecode video or modify media files.
             .setLoadControl(DefaultLoadControl.Builder()
                 .setBufferDurationsMs(
-                    DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                    DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
+                    60_000,
+                    65_000,
                     100,
                     250
                 )
+                .setTargetBufferBytes(64 * 1024 * 1024)
                 .setBackBuffer(15_000, true)
                 .build())
             // Exact seek decodes forward from the previous keyframe instead of
@@ -105,6 +109,14 @@ class PlaybackService : MediaSessionService() {
             .build()
         player.repeatMode = playbackQueueStore.mode().repeatMode
         player.addListener(object : androidx.media3.common.Player.Listener {
+            override fun onEvents(
+                player: androidx.media3.common.Player,
+                events: androidx.media3.common.Player.Events
+            ) {
+                renderersFactory.allowAudioFirst = player.playWhenReady &&
+                    player.currentTracks.isTypeSelected(C.TRACK_TYPE_AUDIO)
+            }
+
             override fun onRepeatModeChanged(repeatMode: Int) {
                 playbackQueueStore.saveMode(PlaybackMode.fromRepeatMode(repeatMode))
             }

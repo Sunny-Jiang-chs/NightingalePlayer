@@ -11,8 +11,8 @@ android {
         applicationId = "com.myp.sleepplayer"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.4"
+        versionCode = 13
+        versionName = "0.5"
     }
 
     buildTypes {
@@ -63,4 +63,13 @@ tasks.register<JavaExec>("verifyPlaybackQueue") {
         layout.buildDirectory.dir("tmp/kotlin-classes/debug")
     ) + configurations.getByName("debugUnitTestRuntimeClasspath")
     mainClass.set("com.myp.sleepplayer.playback.PlaybackQueueTest")
+}
+
+tasks.register<JavaExec>("verifyH264Dependencies") {
+    dependsOn("compileDebugUnitTestKotlin")
+    classpath = files(
+        layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
+        layout.buildDirectory.dir("tmp/kotlin-classes/debug")
+    ) + configurations.getByName("debugUnitTestRuntimeClasspath")
+    mainClass.set("com.myp.sleepplayer.playback.H264SampleDependenciesTest")
 }
