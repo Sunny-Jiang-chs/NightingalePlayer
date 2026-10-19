@@ -35,6 +35,29 @@ internal class PlaybackQueueStore(private val preferences: SharedPreferences) {
         preferences.edit().putInt(KEY_MODE, mode.repeatMode).apply()
     }
 
+    fun source(): PlaybackSource = PlaybackSource.restore(
+        storedString(KEY_SOURCE), directoryPlayback() != null, playlist() != null
+    )
+
+    fun saveSource(source: PlaybackSource) {
+        preferences.edit().putString(KEY_SOURCE, source.name).apply()
+    }
+
+    fun directoryMode(): DirectoryRepeatMode =
+        DirectoryRepeatMode.fromRepeatMode(preferences.getInt(KEY_DIRECTORY_MODE, 0))
+
+    fun saveDirectoryMode(mode: DirectoryRepeatMode) {
+        preferences.edit().putInt(KEY_DIRECTORY_MODE, mode.repeatMode).apply()
+    }
+
+    fun activeRepeatMode(): Int =
+        if (source() == PlaybackSource.PLAYLIST) mode().repeatMode else directoryMode().repeatMode
+
+    fun saveActiveRepeatMode(repeatMode: Int) {
+        if (source() == PlaybackSource.PLAYLIST) saveMode(PlaybackMode.fromRepeatMode(repeatMode))
+        else saveDirectoryMode(DirectoryRepeatMode.fromRepeatMode(repeatMode))
+    }
+
     fun playlist(): List<MediaEntry>? = readEntries(KEY_PLAYLIST).takeIf { it.isNotEmpty() }
 
     fun savePlaylist(entries: List<MediaEntry>?) {
@@ -312,5 +335,7 @@ internal class PlaybackQueueStore(private val preferences: SharedPreferences) {
         const val KEY_NAMED_PLAYLISTS = "named_playlists"
         const val KEY_ACTIVE_PLAYLIST_ID = "active_playlist_id"
         const val KEY_DIRECTORY_PLAYBACK = "directory_playback"
+        const val KEY_SOURCE = "playback_source"
+        const val KEY_DIRECTORY_MODE = "directory_repeat_mode"
     }
 }

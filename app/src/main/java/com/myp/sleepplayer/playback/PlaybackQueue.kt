@@ -10,8 +10,35 @@ internal enum class PlaybackMode(val repeatMode: Int, val label: String) {
     }
 }
 
+internal enum class PlaybackSource {
+    DIRECTORY, PLAYLIST;
+
+    companion object {
+        fun restore(value: String?, hasDirectoryQueue: Boolean, hasPlaylist: Boolean): PlaybackSource =
+            entries.firstOrNull { it.name == value }
+                ?: if (!hasDirectoryQueue && hasPlaylist) PLAYLIST else DIRECTORY
+    }
+}
+
+internal enum class DirectoryRepeatMode(val repeatMode: Int, val label: String) {
+    REPEAT_ONE(1, "单集循环"),
+    REPEAT_ALL(2, "列表循环"),
+    OFF(0, "不循环");
+
+    companion object {
+        fun fromRepeatMode(value: Int): DirectoryRepeatMode =
+            entries.firstOrNull { it.repeatMode == value } ?: OFF
+    }
+}
+
 /** A null selection follows the directory; a saved selection retains its explicit order. */
 internal object PlaybackQueue {
+    fun <T> playbackEntries(
+        source: PlaybackSource,
+        directory: List<T>,
+        playlist: List<T>
+    ): List<T> = if (source == PlaybackSource.PLAYLIST) playlist else directory
+
     fun resolve(available: List<String>, selected: List<String>?): List<String> {
         val availableSet = available.toSet()
         return selected?.distinct()?.filter { it in availableSet } ?: available.distinct()

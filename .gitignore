@@ -2,5 +2,9 @@
 build/
 app/build/
 local.properties
-tmp/
+# README 展示素材随仓库保存，其余临时文件不入库。
+tmp/*
+!tmp/readme-demo/
+tmp/readme-demo/*
+!tmp/readme-demo/published/
 test-media/

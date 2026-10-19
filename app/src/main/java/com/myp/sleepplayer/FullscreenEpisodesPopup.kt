@@ -1,23 +1,29 @@
 package com.myp.sleepplayer
 
 import android.app.Activity
+import android.app.Dialog
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.content.res.ColorStateList
 import android.text.TextUtils
+import android.os.Build
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
+import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
-import android.widget.PopupWindow
 import android.widget.TextView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.myp.sleepplayer.media.MediaEntry
 import kotlin.math.roundToInt
 
@@ -31,9 +37,9 @@ internal class FullscreenEpisodesPopup(
 ) {
     private var playingUri = currentUri
     private val adapter = EpisodesAdapter()
-    private var popup: PopupWindow? = null
+    private var popup: Dialog? = null
 
-    fun show(anchor: View, onDismiss: () -> Unit) {
+    fun show(onDismiss: () -> Unit) {
         val overlay = FrameLayout(activity).apply {
             setBackgroundColor(Color.argb(80, 0, 0, 0))
             setOnClickListener { dismiss() }
@@ -53,7 +59,7 @@ internal class FullscreenEpisodesPopup(
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             setTextColor(activity.getColor(R.color.player_text))
-        }, LinearLayout.LayoutParams(0, dp(44), 1f))
+        }, LinearLayout.LayoutParams(0, dp(48), 1f))
         header.addView(ImageButton(activity).apply {
             setImageResource(R.drawable.ic_close)
             setColorFilter(activity.getColor(R.color.player_text_muted))
@@ -61,7 +67,7 @@ internal class FullscreenEpisodesPopup(
             setPadding(dp(12), dp(12), dp(12), dp(12))
             contentDescription = "关闭选集"
             setOnClickListener { dismiss() }
-        }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        }, LinearLayout.LayoutParams(dp(48), dp(48)))
         panel.addView(header)
         if (entries.isEmpty()) {
             panel.addView(TextView(activity).apply {
@@ -81,21 +87,53 @@ internal class FullscreenEpisodesPopup(
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         }
         overlay.addView(panel, FrameLayout.LayoutParams(
-            minOf(dp(360), (anchor.width * 0.55f).roundToInt()),
+            dp(360),
             ViewGroup.LayoutParams.MATCH_PARENT,
             Gravity.END
         ))
-        popup = PopupWindow(overlay, anchor.width, anchor.height, true).apply {
-            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
-            elevation = 0f
+        // Measure inside the actual fullscreen window instead of positioning a popup
+        // from PlayerView screen coordinates, which OEM popup windows can clip.
+        fun fitPanel() {
+            val availableWidth = overlay.width - overlay.paddingLeft - overlay.paddingRight
+            if (availableWidth <= 0) return
+            val width = minOf(dp(360), (availableWidth * 0.55f).roundToInt())
+            if (panel.layoutParams.width != width) {
+                panel.layoutParams = panel.layoutParams.apply { this.width = width }
+            }
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(overlay) { view, insets ->
+            val safe = insets.getInsetsIgnoringVisibility(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
+            fitPanel()
+            insets
+        }
+        overlay.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitPanel() }
+        popup = Dialog(activity).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+            setContentView(overlay)
             setOnDismissListener {
                 popup = null
                 onDismiss()
             }
-            val location = IntArray(2)
-            anchor.getLocationOnScreen(location)
-            showAtLocation(anchor, Gravity.TOP or Gravity.LEFT, location[0], location[1])
+            window?.apply {
+                setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                WindowCompat.setDecorFitsSystemWindows(this, false)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    attributes = attributes.apply {
+                        layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+                }
+                WindowInsetsControllerCompat(this, decorView).apply {
+                    hide(WindowInsetsCompat.Type.systemBars())
+                    systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            }
+            show()
+            window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            ViewCompat.requestApplyInsets(overlay)
         }
     }
 

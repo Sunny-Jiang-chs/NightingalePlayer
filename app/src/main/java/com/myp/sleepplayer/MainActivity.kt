@@ -74,7 +74,10 @@ import com.myp.sleepplayer.playback.PlaybackControlSettings
 import com.myp.sleepplayer.playback.PlaybackControlStore
 import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
 import com.myp.sleepplayer.playback.PlaybackMode
+import com.myp.sleepplayer.playback.PlaybackSource
+import com.myp.sleepplayer.playback.DirectoryRepeatMode
 import com.myp.sleepplayer.playback.PlaybackQueueStore
+import com.myp.sleepplayer.playback.PlaybackQueue
 import com.myp.sleepplayer.playback.SavedPlaylist
 import com.myp.sleepplayer.playback.PlaybackStateStore
 import com.myp.sleepplayer.playback.SleepTimerStore
@@ -239,6 +242,7 @@ class MainActivity : Activity() {
     private var isLibraryLoading = false
     private var playlistEntries: List<MediaEntry> = emptyList()
     private var directoryPlaybackEntries: List<MediaEntry>? = null
+    private var playbackSource = PlaybackSource.DIRECTORY
     private data class ClearedPlaylist(val entries: List<MediaEntry>, val resumePlaylist: Boolean, val savedId: String?)
     private var clearedPlaylist: ClearedPlaylist? = null
     private var playlistUndoRow: View? = null
@@ -361,6 +365,8 @@ class MainActivity : Activity() {
         subtitleBottomDp = subtitleSettings.bottomDp
         playlistEntries = playbackQueueStore.playlist().orEmpty()
         directoryPlaybackEntries = playbackQueueStore.directoryPlayback()
+        playbackSource = playbackQueueStore.source()
+        playbackQueueStore.saveSource(playbackSource)
         buildUi()
         registerFullscreenBackHandler()
         connectController()
@@ -571,7 +577,11 @@ class MainActivity : Activity() {
                     }
 
                     override fun onRepeatModeChanged(repeatMode: Int) {
-                        playlistLoopCheck?.isChecked = PlaybackMode.fromRepeatMode(repeatMode) == PlaybackMode.REPEAT_ALL
+                        playlistLoopCheck?.isChecked = currentPlaybackMode() == PlaybackMode.REPEAT_ALL
+                    }
+
+                    override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) {
+                        if (reason == Player.TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED) episodesPopup?.dismiss()
                     }
 
                     override fun onPlaybackStateChanged(playbackState: Int) {
@@ -589,7 +599,7 @@ class MainActivity : Activity() {
                 })
                 updateScreenAwakeState()
                 controller?.setPlaybackSpeed(playbackSpeed)
-                controller?.repeatMode = playbackQueueStore.mode().repeatMode
+                controller?.repeatMode = playbackQueueStore.activeRepeatMode()
                 if (directoryPlaybackEntries != null || playlistEntries.isNotEmpty() ||
                     (librarySource != null && !isLibraryLoading)) applyPlaybackQueue()
                 renderLibrary()
@@ -973,6 +983,7 @@ class MainActivity : Activity() {
                     if (clearedPlaylist !== previous) return@quietAction
                     playbackQueueStore.setActivePlaylistId(previous.savedId)
                     if (previous.resumePlaylist) {
+                        setPlaybackSource(PlaybackSource.PLAYLIST)
                         directoryPlaybackEntries = null
                         playbackQueueStore.saveDirectoryPlayback(null)
                     }
@@ -1348,21 +1359,30 @@ class MainActivity : Activity() {
         radius = dp(6)
     )
 
-    private fun currentPlaybackMode(): PlaybackMode = controller?.let {
-        PlaybackMode.fromRepeatMode(it.repeatMode)
-    } ?: playbackQueueStore.mode()
+    private fun currentPlaybackMode(): PlaybackMode = playbackQueueStore.mode()
 
     private fun setPlaybackMode(mode: PlaybackMode) {
         playbackQueueStore.saveMode(mode)
-        controller?.repeatMode = mode.repeatMode
+        if (playbackSource == PlaybackSource.PLAYLIST) controller?.repeatMode = mode.repeatMode
         saveActivePlaylist()
     }
 
+    private fun setPlaybackSource(source: PlaybackSource) {
+        playbackSource = source
+        playbackQueueStore.saveSource(source)
+    }
+
     private fun applyPlaybackQueue() {
-        val entries = directoryPlaybackEntries ?: playlistEntries.ifEmpty { loadedEntries }
+        if (playbackSource == PlaybackSource.PLAYLIST && playlistEntries.isEmpty()) {
+            setPlaybackSource(PlaybackSource.DIRECTORY)
+        }
+        val entries = PlaybackQueue.playbackEntries(
+            playbackSource, directoryPlaybackEntries ?: loadedEntries, playlistEntries
+        )
         if (activeEntries != entries) episodesPopup?.dismiss()
         activeEntries = entries
         playbackCoordinator.applyPlaylist(activeEntries)
+        controller?.repeatMode = playbackQueueStore.activeRepeatMode()
     }
 
     private fun availablePlaylistAdditions(): List<MediaEntry> {
@@ -1437,11 +1457,12 @@ class MainActivity : Activity() {
             Toast.makeText(this, "播放器正在连接，请稍后重试", Toast.LENGTH_SHORT).show()
             return
         }
-        val directory = loadedEntries.takeIf { hasPlaylistSection() }
+        val directory = loadedEntries
         if (directoryPlaybackEntries != directory) {
             directoryPlaybackEntries = directory
             playbackQueueStore.saveDirectoryPlayback(directory)
         }
+        setPlaybackSource(PlaybackSource.DIRECTORY)
         applyPlaybackQueue()
         playbackCoordinator.playEntry(activeEntries.indexOfFirst { it.uri == entry.uri })
     }
@@ -1453,6 +1474,7 @@ class MainActivity : Activity() {
         }
         directoryPlaybackEntries = null
         playbackQueueStore.saveDirectoryPlayback(null)
+        setPlaybackSource(PlaybackSource.PLAYLIST)
         applyPlaybackQueue()
         playbackCoordinator.playEntry(activeEntries.indexOfFirst { it.uri == entry.uri })
     }
@@ -1470,8 +1492,8 @@ class MainActivity : Activity() {
     private fun appendToPlaylist(entries: List<MediaEntry>) {
         // An empty playlist currently falls back to directory playback. Keep that
         // queue when adding its first item, just as when adding later items.
-        if (playlistEntries.isEmpty() && directoryPlaybackEntries == null && activeEntries.isNotEmpty()) {
-            directoryPlaybackEntries = activeEntries
+        if (playbackSource == PlaybackSource.DIRECTORY && directoryPlaybackEntries == null && activeEntries.isNotEmpty()) {
+            directoryPlaybackEntries = loadedEntries
             playbackQueueStore.saveDirectoryPlayback(directoryPlaybackEntries)
         }
         savePlaybackQueue(playlistEntries + entries)
@@ -1496,12 +1518,13 @@ class MainActivity : Activity() {
     }
 
     private fun clearCurrentPlaylist() {
-        val previous = ClearedPlaylist(playlistEntries.toList(), directoryPlaybackEntries == null,
+        val previous = ClearedPlaylist(playlistEntries.toList(), playbackSource == PlaybackSource.PLAYLIST,
             playbackQueueStore.activePlaylistId())
         if (previous.resumePlaylist) {
             val currentUri = controller?.currentMediaItem?.localConfiguration?.uri
             directoryPlaybackEntries = activeEntries.firstOrNull { it.uri == currentUri }?.let(::listOf)
             playbackQueueStore.saveDirectoryPlayback(directoryPlaybackEntries)
+            setPlaybackSource(PlaybackSource.DIRECTORY)
         }
         // Clearing the queue does not empty or delete the saved playlist.
         playbackQueueStore.setActivePlaylistId(null)
@@ -1582,8 +1605,15 @@ class MainActivity : Activity() {
     private fun openSavedPlaylist(playlist: SavedPlaylist) {
         // Detach the previous identity before changing mode, so it cannot be overwritten.
         playbackQueueStore.setActivePlaylistId(null)
-        directoryPlaybackEntries = null
-        playbackQueueStore.saveDirectoryPlayback(null)
+        if (playlist.entries.isNotEmpty()) {
+            directoryPlaybackEntries = null
+            playbackQueueStore.saveDirectoryPlayback(null)
+            setPlaybackSource(PlaybackSource.PLAYLIST)
+        } else if (playbackSource == PlaybackSource.PLAYLIST) {
+            directoryPlaybackEntries = activeEntries
+            playbackQueueStore.saveDirectoryPlayback(directoryPlaybackEntries)
+            setPlaybackSource(PlaybackSource.DIRECTORY)
+        }
         playlistCollapsed = false
         setPlaybackMode(playlist.mode)
         playbackQueueStore.setActivePlaylistId(playlist.id)
@@ -1717,6 +1747,22 @@ class MainActivity : Activity() {
 
     private fun showPlayerSettingsMenu(anchor: View) {
         PopupMenu(this, anchor).apply {
+            if (playbackSource == PlaybackSource.DIRECTORY) {
+                menu.addSubMenu("循环播放").apply {
+                    DirectoryRepeatMode.entries.forEach { mode ->
+                        add(1, mode.repeatMode, mode.ordinal, mode.label).apply {
+                            isCheckable = true
+                            isChecked = playbackQueueStore.directoryMode() == mode
+                            setOnMenuItemClickListener {
+                                playbackQueueStore.saveDirectoryMode(mode)
+                                controller?.repeatMode = mode.repeatMode
+                                true
+                            }
+                        }
+                    }
+                    setGroupCheckable(1, true, true)
+                }
+            }
             menu.addSubMenu("画面设置").apply {
                 add("适配画面").setOnMenuItemClickListener {
                     setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
@@ -2172,17 +2218,28 @@ class MainActivity : Activity() {
 
     private fun showFullscreenEpisodes() {
         val video = playerView ?: return
+        val player = controller ?: return
         if (!isFullscreen || video.width == 0 || video.height == 0) return
         volumePopup?.dismiss()
         episodesPopup?.dismiss()
+        // Use the session's queue and order, including when returning from background playback.
+        val knownEntries = (loadedEntries + playlistEntries + activeEntries).associateBy { it.uri }
+        val entries = (0 until player.mediaItemCount).mapNotNull { index ->
+            knownEntries[player.getMediaItemAt(index).localConfiguration?.uri]
+        }
         episodesPopup = FullscreenEpisodesPopup(
             this,
-            activeEntries.toList(),
-            controller?.currentMediaItem?.localConfiguration?.uri?.toString(),
+            entries,
+            player.currentMediaItem?.localConfiguration?.uri?.toString(),
             createPreview = { createMediaPreview(it, maxLines = 2, compact = true) },
-            onPlay = { playbackCoordinator.playEntry(it) }
+            onPlay = { index ->
+                val uri = entries[index].uri
+                playbackCoordinator.playEntry((0 until player.mediaItemCount).firstOrNull {
+                    player.getMediaItemAt(it).localConfiguration?.uri == uri
+                } ?: -1)
+            }
         ).also { picker ->
-            picker.show(video) {
+            picker.show {
                 episodesPopup = null
                 episodesButton?.requestFocus()
                 video.showController()

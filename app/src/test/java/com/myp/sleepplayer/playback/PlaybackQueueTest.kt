@@ -32,7 +32,28 @@ object PlaybackQueueTest {
         assertEquals(PlaybackMode.SEQUENTIAL, PlaybackMode.fromRepeatMode(99))
         assertEquals(PlaybackMode.REPEAT_ALL, PlaybackMode.fromRepeatMode(1))
         assertEquals(PlaybackMode.REPEAT_ALL, PlaybackMode.fromRepeatMode(2))
-        println("Playback queue: 18 checks passed")
+        // Directory single-item repeat must survive saving/restoring, while old
+        // playlist value 1 continues to migrate to the playlist's repeat-all mode.
+        assertEquals(DirectoryRepeatMode.REPEAT_ONE, DirectoryRepeatMode.fromRepeatMode(1))
+        assertEquals(1, DirectoryRepeatMode.fromRepeatMode(1).repeatMode)
+        assertEquals(DirectoryRepeatMode.REPEAT_ALL, DirectoryRepeatMode.fromRepeatMode(2))
+        assertEquals(DirectoryRepeatMode.OFF, DirectoryRepeatMode.fromRepeatMode(0))
+        assertEquals(DirectoryRepeatMode.OFF, DirectoryRepeatMode.fromRepeatMode(99))
+        // Upgrade old queues and keep the playback source independent of the editor.
+        assertEquals(PlaybackSource.DIRECTORY, PlaybackSource.restore(null, false, false))
+        assertEquals(PlaybackSource.DIRECTORY, PlaybackSource.restore(null, true, true))
+        assertEquals(PlaybackSource.PLAYLIST, PlaybackSource.restore(null, false, true))
+        assertEquals(PlaybackSource.DIRECTORY, PlaybackSource.restore("DIRECTORY", false, true))
+        assertEquals(PlaybackSource.PLAYLIST, PlaybackSource.restore("PLAYLIST", true, true))
+        assertEquals(PlaybackSource.DIRECTORY, PlaybackSource.restore("unknown", true, true))
+        val playlist = listOf("c", "a")
+        assertEquals(playlist, PlaybackQueue.playbackEntries(
+            PlaybackSource.PLAYLIST, available, playlist
+        ))
+        assertEquals(available, PlaybackQueue.playbackEntries(
+            PlaybackSource.DIRECTORY, available, playlist
+        ))
+        println("Playback queue: all checks passed")
     }
 
     private fun assertEquals(expected: Any?, actual: Any?) {

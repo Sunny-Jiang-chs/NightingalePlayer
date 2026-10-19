@@ -23,7 +23,6 @@ import androidx.media3.session.MediaSessionService
 import com.myp.sleepplayer.playback.PlaybackControlStore
 import com.myp.sleepplayer.playback.LocalRenderersFactory
 import com.myp.sleepplayer.playback.PlaybackPreferenceFiles
-import com.myp.sleepplayer.playback.PlaybackMode
 import com.myp.sleepplayer.playback.PlaybackQueueStore
 import com.myp.sleepplayer.playback.SleepTimerStore
 import com.myp.sleepplayer.playback.SubtitlePreferencesStore
@@ -107,7 +106,7 @@ class PlaybackService : MediaSessionService() {
             .setSeekBackIncrementMs(10_000)
             .setSeekForwardIncrementMs(30_000)
             .build()
-        player.repeatMode = playbackQueueStore.mode().repeatMode
+        player.repeatMode = playbackQueueStore.activeRepeatMode()
         player.addListener(object : androidx.media3.common.Player.Listener {
             override fun onEvents(
                 player: androidx.media3.common.Player,
@@ -118,7 +117,7 @@ class PlaybackService : MediaSessionService() {
             }
 
             override fun onRepeatModeChanged(repeatMode: Int) {
-                playbackQueueStore.saveMode(PlaybackMode.fromRepeatMode(repeatMode))
+                playbackQueueStore.saveActiveRepeatMode(repeatMode)
             }
 
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
