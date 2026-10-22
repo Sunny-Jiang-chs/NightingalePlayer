@@ -10,6 +10,10 @@ object SubtitleSupportTest {
         rejectsMalformedTimestampAndSerializesWebVtt()
         extractsWebVttCueStarts()
         snapsSeekTargetsToNearestCueStart()
+        smallLeftSwipeSkipsTheCurrentCueThroughoutALongLine()
+        longerSwipesAndReversalUpdateTheTarget()
+        handlesCueBoundariesWithoutSeekingInTheWrongDirection()
+        println("SubtitleSupportTest: parsing and subtitle seek checks passed")
     }
 
     private fun parsesLrcOffsetAndMultipleTimestamps() {
@@ -93,6 +97,33 @@ object SubtitleSupportTest {
             null,
             SubtitleSeekSnapper(emptyList(), 6_000L).snap(1_000L, originMs = 0L, direction = 1)
         )
+    }
+
+    private fun smallLeftSwipeSkipsTheCurrentCueThroughoutALongLine() {
+        val snapper = SubtitleSeekSnapper(listOf(0L, 10_000L, 60_000L), 90_000L)
+        // Starting at the cue boundary or near its end must select the same previous line.
+        assertEquals(0L, snapper.snap(9_900L, originMs = 10_000L, direction = -1))
+        assertEquals(0L, snapper.snap(49_900L, originMs = 50_000L, direction = -1))
+        assertEquals(60_000L, snapper.snap(50_100L, originMs = 50_000L, direction = 1))
+    }
+
+    private fun longerSwipesAndReversalUpdateTheTarget() {
+        val snapper = SubtitleSeekSnapper(listOf(0L, 10_000L, 20_000L, 30_000L, 60_000L, 90_000L), 100_000L)
+        assertEquals(30_000L, snapper.snap(74_900L, originMs = 75_000L, direction = -1))
+        assertEquals(20_000L, snapper.snap(18_000L, originMs = 75_000L, direction = -1))
+        assertEquals(30_000L, snapper.snap(74_900L, originMs = 75_000L, direction = -1))
+        assertEquals(null, snapper.snap(75_000L, originMs = 75_000L, direction = 0))
+        assertEquals(90_000L, snapper.snap(75_100L, originMs = 75_000L, direction = 1))
+    }
+
+    private fun handlesCueBoundariesWithoutSeekingInTheWrongDirection() {
+        val snapper = SubtitleSeekSnapper(listOf(-1L, 1_000L, 1_000L, 5_000L, 9_000L, 11_000L), 10_000L)
+        assertEquals(null, snapper.snap(0L, originMs = 500L, direction = -1))
+        assertEquals(1_000L, snapper.snap(400L, originMs = 500L, direction = 1))
+        assertEquals(1_000L, snapper.snap(3_900L, originMs = 4_000L, direction = -1))
+        assertEquals(1_000L, snapper.snap(4_900L, originMs = 5_000L, direction = -1))
+        assertEquals(5_000L, snapper.snap(9_900L, originMs = 10_000L, direction = -1))
+        assertEquals(null, snapper.snap(10_000L, originMs = 9_000L, direction = 1))
     }
 
     private fun assertEquals(expected: Any?, actual: Any?) {

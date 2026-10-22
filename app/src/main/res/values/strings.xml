@@ -1,3 +1,8 @@
 <resources>
     <string name="app_name">夜莺播放器</string>
+    <string name="thumbnail_loading">加载中</string>
+    <string name="thumbnail_failed">预览失败</string>
+    <string name="thumbnail_description">%1$s，视频封面</string>
+    <string name="thumbnail_loading_description">%1$s，正在加载预览</string>
+    <string name="thumbnail_failed_description">%1$s，预览失败，可尝试直接播放</string>
 </resources>

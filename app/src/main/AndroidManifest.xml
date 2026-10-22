@@ -28,6 +28,11 @@
         </activity>
 
         <service
+            android:name=".ThumbnailDecoderService"
+            android:exported="false"
+            android:process=":thumbnail_decoder" />
+
+        <service
             android:name=".PlaybackService"
             android:exported="true"
             android:foregroundServiceType="mediaPlayback">

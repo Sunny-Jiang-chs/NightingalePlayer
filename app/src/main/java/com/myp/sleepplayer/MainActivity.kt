@@ -267,7 +267,6 @@ class MainActivity : Activity() {
     private var audioSectionCollapsed = false
     private var subtitleSizeSp = 20f
     private var subtitleColor = Color.WHITE
-    private var subtitleBackgroundAlpha = 150
     private var subtitleBottomDp = 42
     private var isFullscreen = false
     private var waitingForAllFilesAccess = false
@@ -361,7 +360,6 @@ class MainActivity : Activity() {
         snapSeekToCueStarts = subtitlePreferencesStore.snapSeekToCueStarts()
         subtitleSizeSp = subtitleSettings.sizeSp
         subtitleColor = subtitleSettings.color
-        subtitleBackgroundAlpha = subtitleSettings.backgroundAlpha
         subtitleBottomDp = subtitleSettings.bottomDp
         playlistEntries = playbackQueueStore.playlist().orEmpty()
         directoryPlaybackEntries = playbackQueueStore.directoryPlayback()
@@ -1077,8 +1075,8 @@ class MainActivity : Activity() {
         addLibrarySectionHeader(section, "当前目录内容 · ${loadedEntries.size} 项", "当前目录内容",
             !directoryCollapsed, primary = true) {
             directoryCollapsed = !directoryCollapsed
-            if (!directoryCollapsed) populate()
             body.visibility = if (directoryCollapsed) View.GONE else View.VISIBLE
+            if (!directoryCollapsed) populate()
         }
         if (!directoryCollapsed) populate()
         section.addView(body)
@@ -1106,23 +1104,20 @@ class MainActivity : Activity() {
                        onCollapsed: (Boolean) -> Unit) {
             if (entries.isEmpty()) return
             var hidden = collapsed
-            var populated = false
-            val group = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
+            val group = VirtualMediaListView(
+                context = this,
+                itemCount = entries.size,
+                rowHeightPx = dp(if (entries.first().isVideo) 64 else 52),
+                rowSpacingPx = dp(2),
+                createRow = { index -> createLibraryEntry(entries[index]) }
+            ).apply {
                 visibility = if (hidden) View.GONE else View.VISIBLE
-            }
-            fun populate() {
-                if (populated) return
-                populated = true
-                entries.forEach { addLibraryEntry(group, it) }
             }
             addLibrarySectionHeader(body, title, label, !hidden) {
                 hidden = !hidden
                 onCollapsed(hidden)
-                if (!hidden) populate()
                 group.visibility = if (hidden) View.GONE else View.VISIBLE
             }
-            if (!hidden) populate()
             body.addView(group)
         }
         val videos = loadedEntries.filter { it.isVideo }
@@ -1240,11 +1235,8 @@ class MainActivity : Activity() {
         return titleView
     }
 
-    private fun addLibraryEntry(
-        container: LinearLayout,
-        entry: MediaEntry
-    ) {
-        container.addView(createMediaPreview(entry).apply {
+    private fun createLibraryEntry(entry: MediaEntry): View {
+        return createMediaPreview(entry).apply {
             isClickable = true
             isFocusable = true
             contentDescription = "${entry.name}，播放"
@@ -1280,7 +1272,7 @@ class MainActivity : Activity() {
                     true
                 }
             }
-        })
+        }
     }
 
     private fun createMediaPreview(entry: MediaEntry, label: String = entry.name, maxLines: Int = 1, compact: Boolean = false): View {
@@ -1858,12 +1850,6 @@ class MainActivity : Activity() {
             progress = (subtitleSizeSp - 12f).roundToInt()
             minimumHeight = dp(48)
         }
-        val alphaLabel = settingLabel()
-        val alphaSeek = SeekBar(this).apply {
-            max = 255
-            progress = subtitleBackgroundAlpha
-            minimumHeight = dp(48)
-        }
         val bottomLabel = settingLabel()
         val bottomSeek = SeekBar(this).apply {
             max = 172
@@ -1875,18 +1861,13 @@ class MainActivity : Activity() {
         }
         fun updatePreview() {
             val size = (12 + sizeSeek.progress).toFloat()
-            val alpha = alphaSeek.progress
             val bottom = 8 + bottomSeek.progress
             sizeLabel.text = "字号：${size.toInt()}sp"
-            alphaLabel.text = "背景透明度：${(alpha * 100 / 255)}%"
             bottomLabel.text = "距屏幕底部：${bottom}dp"
             colorButton.text = "字幕颜色：${subtitleColorName(subtitleColor)}"
             preview.textSize = size
             preview.setTextColor(subtitleColor)
-            preview.background = GradientDrawable().apply {
-                setColor(Color.argb(alpha, 0, 0, 0))
-                cornerRadius = dp(8).toFloat()
-            }
+            preview.setShadowLayer(dp(3).toFloat(), 0f, dp(2).toFloat(), Color.BLACK)
         }
         colorButton.setOnClickListener { anchor ->
             PopupMenu(this, anchor).apply {
@@ -1906,12 +1887,9 @@ class MainActivity : Activity() {
             }
         }
         sizeSeek.setOnSeekBarChangeListener(previewSeekListener { updatePreview() })
-        alphaSeek.setOnSeekBarChangeListener(previewSeekListener { updatePreview() })
         bottomSeek.setOnSeekBarChangeListener(previewSeekListener { updatePreview() })
         panel.addView(sizeLabel)
         panel.addView(sizeSeek)
-        panel.addView(alphaLabel)
-        panel.addView(alphaSeek)
         panel.addView(bottomLabel)
         panel.addView(bottomSeek)
         panel.addView(colorButton)
@@ -1930,7 +1908,6 @@ class MainActivity : Activity() {
                     Toast.makeText(this, "请先授权悬浮窗权限，后台字幕才会显示", Toast.LENGTH_LONG).show()
                 }
                 subtitleSizeSp = (12 + sizeSeek.progress).toFloat()
-                subtitleBackgroundAlpha = alphaSeek.progress
                 subtitleBottomDp = 8 + bottomSeek.progress
                 applyPlayerSubtitleStyle()
                 sendSubtitleSettings()
@@ -1978,7 +1955,6 @@ class MainActivity : Activity() {
             action = PlaybackService.ACTION_SET_SUBTITLE_STYLE
             putExtra(PlaybackService.EXTRA_SUBTITLE_SIZE, subtitleSizeSp)
             putExtra(PlaybackService.EXTRA_SUBTITLE_COLOR, subtitleColor)
-            putExtra(PlaybackService.EXTRA_SUBTITLE_BACKGROUND_ALPHA, subtitleBackgroundAlpha)
             putExtra(PlaybackService.EXTRA_SUBTITLE_BOTTOM, subtitleBottomDp)
         })
         updateSubtitleButtonStyle()
@@ -1992,7 +1968,7 @@ class MainActivity : Activity() {
             setStyle(
                 CaptionStyleCompat(
                     subtitleColor,
-                    Color.argb(subtitleBackgroundAlpha, 0, 0, 0),
+                    Color.TRANSPARENT,
                     Color.TRANSPARENT,
                     CaptionStyleCompat.EDGE_TYPE_OUTLINE,
                     Color.BLACK,
@@ -2404,6 +2380,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        scanSequence++
         playbackCoordinator.savePosition()
         dismissPlaylistUndo()
         mainHandler.removeCallbacks(progressTicker)
@@ -2593,7 +2570,10 @@ class MainActivity : Activity() {
                     lastVideoTapUpTime = 0L
                 }
                 if (!scrubGestureCaptured) {
-                    val horizontal = abs(deltaX) > dp(12) && abs(deltaX) > abs(deltaY) * 1.2f
+                    val horizontalSlop = if (scrubSnapper != null) {
+                        ViewConfiguration.get(this).scaledTouchSlop
+                    } else dp(12)
+                    val horizontal = abs(deltaX) > horizontalSlop && abs(deltaX) > abs(deltaY) * 1.2f
                     val vertical = abs(deltaY) > dp(12) && abs(deltaY) > abs(deltaX) * 1.2f
                     if (!horizontal && !vertical) return false
                     mainHandler.removeCallbacks(longPressSpeedBoostRunnable)

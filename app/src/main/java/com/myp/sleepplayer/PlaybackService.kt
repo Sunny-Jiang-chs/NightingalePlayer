@@ -42,7 +42,6 @@ class PlaybackService : MediaSessionService() {
         const val ACTION_SET_SUBTITLE_STYLE = "com.myp.sleepplayer.action.SET_SUBTITLE_STYLE"
         const val EXTRA_SUBTITLE_SIZE = "subtitle_size"
         const val EXTRA_SUBTITLE_COLOR = "subtitle_color"
-        const val EXTRA_SUBTITLE_BACKGROUND_ALPHA = "subtitle_background_alpha"
         const val EXTRA_SUBTITLE_BOTTOM = "subtitle_bottom"
         private const val TAG = "SleepVideoPlayer"
     }
@@ -57,7 +56,6 @@ class PlaybackService : MediaSessionService() {
     private var currentSubtitleText = ""
     private var subtitleSizeSp = 20f
     private var subtitleColor = Color.WHITE
-    private var subtitleBackgroundAlpha = 150
     private var subtitleBottomDp = 42
     private var subtitleOverlay: TextView? = null
     private var overlayParams: WindowManager.LayoutParams? = null
@@ -87,6 +85,10 @@ class PlaybackService : MediaSessionService() {
         applySubtitleSettings(subtitlePreferencesStore.read(Color.WHITE))
         val renderersFactory = LocalRenderersFactory(this)
         player = ExoPlayer.Builder(this, renderersFactory)
+            // The video shares a window with scrolling controls and the media library.
+            // Leave display refresh-rate policy to the UI/system instead of voting at the
+            // video's frame rate. This preserves Media3's video release timing and VSync.
+            .setVideoChangeFrameRateStrategy(C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_OFF)
             // Local files do not need the default multi-second start/rebuffer gate.
             // Aim for a minute of compressed lookahead, with a 64 MiB loading target taking
             // precedence over duration. This does not predecode video or modify media files.
@@ -234,10 +236,6 @@ class PlaybackService : MediaSessionService() {
                 overlayEnabled = overlayEnabled,
                 sizeSp = intent.getFloatExtra(EXTRA_SUBTITLE_SIZE, subtitleSizeSp).coerceIn(12f, 36f),
                 color = intent.getIntExtra(EXTRA_SUBTITLE_COLOR, subtitleColor),
-                backgroundAlpha = intent.getIntExtra(
-                    EXTRA_SUBTITLE_BACKGROUND_ALPHA,
-                    subtitleBackgroundAlpha
-                ).coerceIn(0, 255),
                 bottomDp = intent.getIntExtra(EXTRA_SUBTITLE_BOTTOM, subtitleBottomDp).coerceIn(8, 180)
             )
         )
@@ -246,7 +244,6 @@ class PlaybackService : MediaSessionService() {
                 overlayEnabled = overlayEnabled,
                 sizeSp = subtitleSizeSp,
                 color = subtitleColor,
-                backgroundAlpha = subtitleBackgroundAlpha,
                 bottomDp = subtitleBottomDp
             )
         )
@@ -258,7 +255,6 @@ class PlaybackService : MediaSessionService() {
         overlayEnabled = settings.overlayEnabled
         subtitleSizeSp = settings.sizeSp
         subtitleColor = settings.color
-        subtitleBackgroundAlpha = settings.backgroundAlpha
         subtitleBottomDp = settings.bottomDp
     }
 
@@ -317,7 +313,7 @@ class PlaybackService : MediaSessionService() {
         subtitleOverlay?.apply {
             textSize = subtitleSizeSp
             setTextColor(subtitleColor)
-            setBackgroundColor(Color.argb(subtitleBackgroundAlpha, 0, 0, 0))
+            setBackgroundColor(Color.TRANSPARENT)
             setShadowLayer(dp(3).toFloat(), 0f, dp(2).toFloat(), Color.BLACK)
         }
     }

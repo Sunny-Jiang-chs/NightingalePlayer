@@ -35,7 +35,7 @@
   </tr>
   <tr>
     <td><a href="tmp/readme-demo/published/main.jpg"><img src="tmp/readme-demo/published/main.jpg" width="260" alt="播放页面：夜景视频、字幕与可循环的晚安歌单"></a></td>
-    <td><a href="tmp/readme-demo/published/subtitles.jpg"><img src="tmp/readme-demo/published/subtitles.jpg" width="260" alt="字幕设置：字号、颜色、背景透明度与实时预览"></a></td>
+    <td><a href="tmp/readme-demo/published/subtitles.jpg"><img src="tmp/readme-demo/published/subtitles.jpg" width="260" alt="字幕设置：字号、颜色与实时预览"></a></td>
     <td><a href="tmp/readme-demo/published/timer-active.jpg"><img src="tmp/readme-demo/published/timer-active.jpg" width="260" alt="睡眠定时：快捷时长、自定义分钟数与剩余时间"></a></td>
   </tr>
 </table>

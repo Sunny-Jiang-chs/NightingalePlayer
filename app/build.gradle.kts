@@ -11,8 +11,8 @@ android {
         applicationId = "com.myp.sleepplayer"
         minSdk = 26
         targetSdk = 36
-        versionCode = 14
-        versionName = "0.5.1"
+        versionCode = 27
+        versionName = "0.5.3"
     }
 
     buildTypes {
@@ -72,4 +72,31 @@ tasks.register<JavaExec>("verifyH264Dependencies") {
         layout.buildDirectory.dir("tmp/kotlin-classes/debug")
     ) + configurations.getByName("debugUnitTestRuntimeClasspath")
     mainClass.set("com.myp.sleepplayer.playback.H264SampleDependenciesTest")
+}
+
+tasks.register<JavaExec>("verifyThumbnailDecode") {
+    dependsOn("compileDebugUnitTestKotlin")
+    classpath = files(
+        layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
+        layout.buildDirectory.dir("tmp/kotlin-classes/debug")
+    ) + configurations.getByName("debugUnitTestRuntimeClasspath")
+    mainClass.set("com.myp.sleepplayer.ThumbnailDecodeTaskTest")
+}
+
+tasks.register<JavaExec>("verifyThumbnailMidpoint") {
+    dependsOn("compileDebugUnitTestKotlin")
+    classpath = files(
+        layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
+        layout.buildDirectory.dir("tmp/kotlin-classes/debug")
+    ) + configurations.getByName("debugUnitTestRuntimeClasspath")
+    mainClass.set("com.myp.sleepplayer.ThumbnailMidpointTest")
+}
+
+tasks.register<JavaExec>("verifyThumbnailPrefetch") {
+    dependsOn("compileDebugUnitTestKotlin")
+    classpath = files(
+        layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
+        layout.buildDirectory.dir("tmp/kotlin-classes/debug")
+    ) + configurations.getByName("debugUnitTestRuntimeClasspath")
+    mainClass.set("com.myp.sleepplayer.ThumbnailPrefetchWindowTest")
 }

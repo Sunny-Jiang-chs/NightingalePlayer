@@ -12,11 +12,16 @@ internal class SubtitleSeekSnapper(cueStartTimesMs: Iterable<Long>, durationMs: 
         get() = cueStarts.isNotEmpty()
 
     fun snap(targetMs: Long, originMs: Long, direction: Int): Long? {
-        if (cueStarts.isEmpty()) return null
+        if (cueStarts.isEmpty() || direction == 0) return null
         val target = targetMs.coerceAtLeast(0L)
         val origin = originMs.coerceAtLeast(0L)
         val fromIndex = if (direction > 0) upperBound(origin) else 0
-        val untilIndex = if (direction < 0) lowerBound(origin) else cueStarts.size
+        // Exclude the current cue even when playback is already partway through it.
+        val untilIndex = if (direction < 0) {
+            val currentIndex = upperBound(origin) - 1
+            // With no previous cue, allow restarting the first one.
+            if (currentIndex == 0) 1 else currentIndex.coerceAtLeast(0)
+        } else cueStarts.size
         if (fromIndex >= untilIndex) return null
 
         val insertionPoint = lowerBound(target, fromIndex, untilIndex)
@@ -39,8 +44,6 @@ internal class SubtitleSeekSnapper(cueStartTimesMs: Iterable<Long>, durationMs: 
             else -> after
         }
     }
-
-    private fun lowerBound(value: Long): Int = lowerBound(value, 0, cueStarts.size)
 
     private fun upperBound(value: Long): Int {
         var low = 0
