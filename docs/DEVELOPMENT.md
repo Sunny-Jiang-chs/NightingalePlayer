@@ -10,6 +10,14 @@
 
 技术栈为 Kotlin、Android Views 与 Media3（1.5.1）。
 
+竖屏全屏的几何判定和方向状态分别由 `playback/VideoDisplayShape.kt`、`playback/FullscreenOrientationState.kt` 管理。Media3 的 `VideoSize` 已应用旋转；原始轨道 `Format` 则需结合 `rotationDegrees` 与像素比例计算显示方向，不能重复旋转。手动切换条目时 MediaController 可能暂时保留旧尺寸和轨道，页面先标为未知，等轨道变化或播放就绪后再判定；同尺寸连续视频通过就绪状态重新读取当前轨道，不依赖每次都有尺寸回调。竖屏只临时改变画面模式，原模式仍用于偏好保存，避免调整音量或倍速时把竖屏裁剪状态写成全局设置。
+
+普通播放页为竖屏视频同时提供横屏、竖屏两个放大入口；直接竖屏只请求一次竖屏方向，不先进入横屏。竖屏全屏时，左侧竖屏按钮负责退出全屏，右下角原按钮负责进入横屏；横屏全屏时，左侧进入竖屏、右下角退出全屏。按钮事件由方向状态显式处理，Media3 的全屏按钮状态仅在横屏全屏时设为开启，图标和可访问名称同步更新；尺寸未知时仍保留竖屏全屏的缩小入口。
+
+Media3 1.5.1 的 `setFullscreenButtonState()` 会同步触发全屏按钮回调，因此回调必须按传入状态幂等处理，不能把每次通知都当成一次切换：`true` 进入或保持横屏全屏，`false` 仅从横屏全屏退出，已经处于竖屏或普通播放时保持原状态。全屏状态检查模拟这个同步回调，覆盖横屏转竖屏、返回退出、非竖屏媒体回退和重复通知，防止按钮状态同步再次触发方向切换循环。
+
+`PlayerTimeLayout` 在底栏时间区不足时将原时间控件移到进度条上方、透明度设为 0.65，播放按钮仍留在底栏，触摸目标维持 48dp。时间行保持原 Media3 控件实例；紧凑布局关闭底栏滑动动画、沿用原隐藏超时，宽度足够时恢复单行和原动画。
+
 ## 播放实现与性能
 
 - 视频与页面刷新率：在创建 ExoPlayer 时设置 `VIDEO_CHANGE_FRAME_RATE_STRATEGY_OFF`，关闭 Media3 在 Android 11 及以上对视频 Surface 发出的帧率请求。低帧率 MP4 会触发系统对应用帧率的覆盖，使共用窗口内的媒体库滚动也掉帧；关闭请求后，屏幕刷新率交由 UI 和系统决定，视频解码、帧释放时序与 VSync 保持原实现。用户已在 OnePlus Android 16 实机确认低帧率视频触发该问题，暂停或切换音频文件不出现；修复后页面滚动恢复流畅。此问题不是字幕逐帧重排。
@@ -141,6 +149,7 @@ APK 输出在 `app\build\outputs\apk\debug\app-debug.apk`。这是只构建入�
 .\gradlew.bat --console=plain :app:verifyThumbnailDecode
 .\gradlew.bat --console=plain :app:verifyThumbnailMidpoint
 .\gradlew.bat --console=plain :app:verifyThumbnailPrefetch
+.\gradlew.bat --console=plain :app:verifyVideoDisplayGeometry :app:verifyFullscreenOrientation
 ```
 
 它们会编译相关测试类并执行 JVM 检查，仍会写构建与依赖缓存。播放列表检查覆盖选曲、排序、缺失文件、无效移动和进度恢复；H.264 检查覆盖参考帧与多 slice 判断、未知与截断 NAL 回退、起始码和缓冲区位置保持；缩略图任务检查覆盖成功只完成一次、解码异常、排队取消及异常后线程继续处理下一项。通过不代表设备上的播放、手势、后台服务、预览解码或权限交互已经验收。

@@ -14,6 +14,7 @@
         android:orientation="horizontal">
 
         <FrameLayout
+            android:id="@+id/player_time_slot"
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1">
@@ -72,14 +73,34 @@
                 android:layout_marginLeft="0dp"
                 android:layout_marginRight="0dp" />
 
-            <!-- The volume button is inserted immediately before fullscreen. -->
+            <!-- The volume button is inserted before the orientation/fullscreen pair. -->
+            <ImageButton
+                android:id="@+id/portrait_adaptation"
+                style="@style/ExoStyledControls.Button.Bottom"
+                android:layout_marginLeft="0dp"
+                android:layout_marginRight="0dp"
+                android:contentDescription="@string/portrait_adaptation"
+                android:src="@drawable/ic_portrait_playback"
+                android:visibility="gone" />
+
             <ImageButton
                 android:id="@id/exo_fullscreen"
                 style="@style/ExoStyledControls.Button.Bottom.FullScreen"
+                android:src="@drawable/ic_landscape_playback"
                 android:layout_marginLeft="0dp"
                 android:layout_marginRight="0dp" />
         </LinearLayout>
     </LinearLayout>
+
+    <FrameLayout
+        android:id="@+id/compact_player_time"
+        android:layout_width="match_parent"
+        android:layout_height="20dp"
+        android:layout_gravity="bottom"
+        android:layout_marginBottom="104dp"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:visibility="gone" />
 
     <View
         android:id="@id/exo_progress_placeholder"

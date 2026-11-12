@@ -56,6 +56,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.ViewCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.media3.common.Player
+import androidx.media3.common.C
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -84,6 +86,10 @@ import com.myp.sleepplayer.playback.SleepTimerStore
 import com.myp.sleepplayer.playback.SubtitlePreferencesStore
 import com.myp.sleepplayer.playback.SubtitleSeekSnapper
 import com.myp.sleepplayer.playback.SubtitleSettings
+import com.myp.sleepplayer.playback.FullscreenMode
+import com.myp.sleepplayer.playback.FullscreenOrientationState
+import com.myp.sleepplayer.playback.VideoDisplayGeometry
+import com.myp.sleepplayer.playback.VideoDisplayShape
 import java.io.File
 import java.util.Locale
 import kotlin.math.abs
@@ -230,6 +236,7 @@ class MainActivity : Activity() {
     private var timerCountdownView: TextView? = null
     private var timerDialog: AlertDialog? = null
     private var playbackButton: ImageButton? = null
+    private var playerTimeLayout: PlayerTimeLayout? = null
     private var speakerButton: ImageButton? = null
     private var volumePopup: PopupWindow? = null
     private var episodesButton: TextView? = null
@@ -268,10 +275,15 @@ class MainActivity : Activity() {
     private var subtitleSizeSp = 20f
     private var subtitleColor = Color.WHITE
     private var subtitleBottomDp = 42
-    private var isFullscreen = false
+    private val fullscreenOrientation = FullscreenOrientationState()
+    private val isFullscreen: Boolean get() = fullscreenOrientation.mode != FullscreenMode.INLINE
+    private val isPortraitFullscreen: Boolean get() = fullscreenOrientation.mode == FullscreenMode.PORTRAIT
+    private var videoTracksAwaitingConfirmation = false
+    private var confirmedVideoSize: VideoSize? = null
     private var waitingForAllFilesAccess = false
     private var isActivityStarted = false
     private var scanSequence = 0
+    private var mediaSelectionSequence = 0
     private var scanFuture: Future<*>? = null
     private var isSeeking = false
     private var scrubGestureEligible = false
@@ -434,13 +446,18 @@ class MainActivity : Activity() {
             setKeepContentOnPlayerReset(true)
             useController = true
             controllerShowTimeoutMs = 5_000
-            setFullscreenButtonClickListener { fullscreen -> setFullscreen(fullscreen) }
+            setFullscreenButtonClickListener { fullscreen ->
+                val previousMode = fullscreenOrientation.mode
+                fullscreenOrientation.onFullscreenButtonStateChanged(fullscreen)
+                applyFullscreenPresentation(previousMode)
+            }
             setBackgroundColor(Color.BLACK)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 normalPlayerHeight()
             )
         }
+        installPortraitAdaptationButton()
         scrubOverlayView = TextView(this).apply {
             visibility = View.GONE
             gravity = Gravity.CENTER
@@ -472,8 +489,9 @@ class MainActivity : Activity() {
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
                     videoScale = (videoScale * detector.scaleFactor).coerceIn(1f, 3f)
-                    playerView?.scaleX = videoScale
-                    playerView?.scaleY = videoScale
+                    val target = if (isPortraitFullscreen) playerView?.videoSurfaceView else playerView
+                    target?.scaleX = videoScale
+                    target?.scaleY = videoScale
                     return true
                 }
             })
@@ -549,6 +567,11 @@ class MainActivity : Activity() {
                 attachSettingsButtonToPlayerControls()
                 attachEpisodesButtonToPlayerControls()
                 stylePlayerControls()
+                if (playerTimeLayout == null) {
+                    playerView?.let { video ->
+                        playbackButton?.let { button -> playerTimeLayout = PlayerTimeLayout(video, button) }
+                    }
+                }
                 controller?.volume = if (isMuted) 0f else lastVolume
                 updateSpeakerButton()
                 setGain(gainDb)
@@ -570,6 +593,12 @@ class MainActivity : Activity() {
                     }
 
                     override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
+                        // A controller locally masks seeks before the service supplies the new
+                        // tracks. Both currentTracks and videoSize may still belong to the old item.
+                        videoTracksAwaitingConfirmation = reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK ||
+                            reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED
+                        confirmedVideoSize = null
+                        updateVideoShape(VideoDisplayShape.UNKNOWN)
                         updatePlaylistHighlight()
                         episodesPopup?.updateCurrent(mediaItem?.localConfiguration?.uri?.toString())
                     }
@@ -587,6 +616,32 @@ class MainActivity : Activity() {
                         updateBufferingIndicator()
                     }
 
+                    override fun onEvents(player: Player, events: Player.Events) {
+                        if (!events.containsAny(
+                                Player.EVENT_MEDIA_ITEM_TRANSITION,
+                                Player.EVENT_TRACKS_CHANGED,
+                                Player.EVENT_VIDEO_SIZE_CHANGED,
+                                Player.EVENT_RENDERED_FIRST_FRAME,
+                                Player.EVENT_PLAYBACK_STATE_CHANGED
+                            )) return
+                        if (events.contains(Player.EVENT_TRACKS_CHANGED)) {
+                            videoTracksAwaitingConfirmation = false
+                            confirmedVideoSize = null
+                        }
+                        if (events.contains(Player.EVENT_PLAYBACK_STATE_CHANGED) &&
+                            (player.playbackState == Player.STATE_READY || player.playbackState == Player.STATE_ENDED)) {
+                            // Same-sized consecutive videos need not emit a new size/track event.
+                            videoTracksAwaitingConfirmation = false
+                        }
+                        if (!videoTracksAwaitingConfirmation &&
+                            !events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION) &&
+                            (events.contains(Player.EVENT_VIDEO_SIZE_CHANGED) ||
+                                events.contains(Player.EVENT_RENDERED_FIRST_FRAME))) {
+                            confirmedVideoSize = player.videoSize
+                        }
+                        refreshVideoShape(player)
+                    }
+
                     override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                         Toast.makeText(
                             this@MainActivity,
@@ -595,6 +650,12 @@ class MainActivity : Activity() {
                         ).show()
                     }
                 })
+                controller?.let { player ->
+                    if (player.playbackState == Player.STATE_READY || player.playbackState == Player.STATE_ENDED) {
+                        confirmedVideoSize = player.videoSize
+                    }
+                    refreshVideoShape(player)
+                }
                 updateScreenAwakeState()
                 controller?.setPlaybackSpeed(playbackSpeed)
                 controller?.repeatMode = playbackQueueStore.activeRepeatMode()
@@ -726,6 +787,14 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                 (resources.displayMetrics.heightPixels * 0.48f).toInt())
         )
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("选择媒体目录")
+            .setView(panel)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("使用当前目录") { _, _ ->
+                selectFileDirectory(currentDirectory)
+            }
+            .create()
 
         fun renderDirectory() {
             val relativePath = currentDirectory.canonicalPath.removePrefix(storageRoot.path).trimStart('/')
@@ -807,7 +876,21 @@ class MainActivity : Activity() {
                 files.take(previewLimit).forEach { file ->
                     val preview = if (isSupportedMedia(file.name)) {
                         createMediaPreview(MediaEntry(file.name, Uri.fromFile(file), mediaType(file.name), emptyList()),
-                            maxLines = 2, compact = true)
+                            maxLines = 2, compact = true).apply {
+                            if (isExtension(file.name, "mp4")) {
+                                val directory = currentDirectory
+                                isFocusable = true
+                                contentDescription = "${file.name}，选择所在目录并播放"
+                                setOnClickListener {
+                                    if (controller == null) {
+                                        Toast.makeText(this@MainActivity, "播放器正在连接，请稍后重试", Toast.LENGTH_SHORT).show()
+                                        return@setOnClickListener
+                                    }
+                                    dialog.dismiss()
+                                    selectFileDirectory(directory, Uri.fromFile(file))
+                                }
+                            }
+                        }
                     } else TextView(this).apply {
                         text = (if (isSubtitleFile(file.name)) "字幕 · " else "文件 · ") + file.name
                         textSize = 13f
@@ -849,19 +932,16 @@ class MainActivity : Activity() {
             }
         }
         renderDirectory()
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("选择媒体目录")
-            .setView(panel)
-            .setNegativeButton("取消", null)
-            .setPositiveButton("使用当前目录") { _, _ ->
-                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                    .putString(DIRECTORY_PATH, currentDirectory.absolutePath)
-                    .remove(TREE_URI)
-                    .apply()
-                scanFileDirectory(currentDirectory)
-            }
-            .show()
+        dialog.show()
         dialog.window?.setLayout(resources.displayMetrics.widthPixels - dp(24), ViewGroup.LayoutParams.WRAP_CONTENT)
+    }
+
+    private fun selectFileDirectory(directory: File, playAfterScan: Uri? = null) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(DIRECTORY_PATH, directory.absolutePath)
+            .remove(TREE_URI)
+            .apply()
+        scanFileDirectory(directory, playAfterScan)
     }
 
     private fun loadSavedTree() {
@@ -891,7 +971,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun scanFileDirectory(directory: File) {
+    private fun scanFileDirectory(directory: File, playAfterScan: Uri? = null) {
+        val selectionId = if (playAfterScan != null) ++mediaSelectionSequence else mediaSelectionSequence
         val requestId = beginScan(directory.absolutePath)
         scanFuture = scanExecutor.submit {
             val entries = try {
@@ -900,7 +981,18 @@ class MainActivity : Activity() {
                 emptyList()
             }
             runOnUiThread {
-                if (requestId == scanSequence) finishScan(entries)
+                if (requestId != scanSequence) return@runOnUiThread
+                finishScan(entries)
+                if (playAfterScan != null && selectionId == mediaSelectionSequence) {
+                    // Use the scanned entry so subtitle matching and the full
+                    // directory queue are ready before starting the chosen video.
+                    val selected = loadedEntries.firstOrNull { it.uri == playAfterScan }
+                    if (selected != null) {
+                        playDirectoryEntry(selected)
+                    } else {
+                        Toast.makeText(this, "所选视频已不存在或无法读取", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         }
     }
@@ -1445,6 +1537,7 @@ class MainActivity : Activity() {
     }
 
     private fun playDirectoryEntry(entry: MediaEntry) {
+        mediaSelectionSequence++
         if (controller == null) {
             Toast.makeText(this, "播放器正在连接，请稍后重试", Toast.LENGTH_SHORT).show()
             return
@@ -1460,6 +1553,7 @@ class MainActivity : Activity() {
     }
 
     private fun playPlaylistEntry(entry: MediaEntry) {
+        mediaSelectionSequence++
         if (controller == null) {
             Toast.makeText(this, "播放器正在连接，请稍后重试", Toast.LENGTH_SHORT).show()
             return
@@ -1997,9 +2091,11 @@ class MainActivity : Activity() {
     private fun gainLabel(): String = if (gainDb == 0) "增益 原声" else "增益 +${gainDb}dB"
 
     private fun setResizeMode(mode: Int) {
-        currentResizeMode = mode
         playerView?.resizeMode = mode
-        playbackControlStore.saveResizeMode(mode)
+        if (!isPortraitFullscreen) {
+            currentResizeMode = mode
+            playbackControlStore.saveResizeMode(mode)
+        }
     }
 
     private fun speedLabel(speed: Float): String =
@@ -2009,6 +2105,127 @@ class MainActivity : Activity() {
         videoScale = 1f
         playerView?.scaleX = 1f
         playerView?.scaleY = 1f
+        playerView?.videoSurfaceView?.scaleX = 1f
+        playerView?.videoSurfaceView?.scaleY = 1f
+    }
+
+    private fun installPortraitAdaptationButton() {
+        val video = playerView ?: return
+        video.findViewById<ImageButton>(R.id.portrait_adaptation)?.setOnClickListener {
+            val previousMode = fullscreenOrientation.mode
+            fullscreenOrientation.onPortraitButtonClick()
+            applyFullscreenPresentation(previousMode)
+            video.showController()
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(video) { _, insets ->
+            // Keep controls clear of camera cutouts and gesture navigation while
+            // allowing the video itself to use the whole fullscreen window.
+            val safe = insets.getInsetsIgnoringVisibility(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            val bottomInset = if (isPortraitFullscreen) safe.bottom else 0
+            video.findViewById<View>(R.id.compact_player_time)?.apply {
+                val params = layoutParams as FrameLayout.LayoutParams
+                params.bottomMargin = dp(104) + bottomInset
+                layoutParams = params
+            }
+            video.findViewById<View>(androidx.media3.ui.R.id.exo_bottom_bar)?.apply {
+                val params = layoutParams as FrameLayout.LayoutParams
+                params.bottomMargin = bottomInset
+                layoutParams = params
+            }
+            video.findViewById<View>(androidx.media3.ui.R.id.exo_progress)?.apply {
+                val params = layoutParams as FrameLayout.LayoutParams
+                params.bottomMargin = resources.getDimensionPixelSize(
+                    androidx.media3.ui.R.dimen.exo_styled_progress_margin_bottom
+                ) + bottomInset
+                layoutParams = params
+            }
+            insets
+        }
+    }
+
+    private fun refreshVideoShape(player: Player) {
+        val shape = when {
+            player.currentMediaItem == null -> VideoDisplayShape.NON_PORTRAIT
+            videoTracksAwaitingConfirmation || player.playbackState == Player.STATE_IDLE -> VideoDisplayShape.UNKNOWN
+            player.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO) -> {
+                val displayShape = confirmedVideoSize?.let {
+                    VideoDisplayGeometry.fromDisplaySize(it.width, it.height, it.pixelWidthHeightRatio)
+                } ?: VideoDisplayShape.UNKNOWN
+                if (displayShape != VideoDisplayShape.UNKNOWN) displayShape else {
+                    // Format is coded geometry, unlike renderer VideoSize: rotate it once.
+                    val shapes = player.currentTracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
+                        .flatMap { group ->
+                            (0 until group.length).filter { group.isTrackSelected(it) }.map { index ->
+                                val format = group.getTrackFormat(index)
+                                VideoDisplayGeometry.fromFormat(
+                                    format.width, format.height, format.pixelWidthHeightRatio, format.rotationDegrees
+                                )
+                            }
+                        }.distinct()
+                    shapes.singleOrNull() ?: VideoDisplayShape.UNKNOWN
+                }
+            }
+            player.currentTracks.isTypeSelected(C.TRACK_TYPE_AUDIO) ||
+                player.playbackState == Player.STATE_READY || player.playbackState == Player.STATE_ENDED ->
+                VideoDisplayShape.NON_PORTRAIT
+            else -> VideoDisplayShape.UNKNOWN
+        }
+        updateVideoShape(shape)
+    }
+
+    private fun updateVideoShape(shape: VideoDisplayShape) {
+        val previousMode = fullscreenOrientation.mode
+        fullscreenOrientation.updateVideoShape(shape)
+        applyFullscreenOrientation(previousMode)
+    }
+
+    private fun applyFullscreenOrientation(previousMode: FullscreenMode) {
+        val mode = fullscreenOrientation.mode
+        if (mode != previousMode) {
+            volumePopup?.dismiss()
+            episodesPopup?.dismiss()
+            if (mode == FullscreenMode.PORTRAIT || previousMode == FullscreenMode.PORTRAIT) {
+                resetVideoScale()
+                // Portrait adjustments stay local to this fullscreen session. The
+                // persisted normal mode also remains intact when changing volume/speed.
+                playerView?.resizeMode = if (isPortraitFullscreen) AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    else currentResizeMode
+            }
+            requestedOrientation = when (mode) {
+                FullscreenMode.INLINE -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                FullscreenMode.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                FullscreenMode.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
+            playerView?.let { ViewCompat.requestApplyInsets(it) }
+        }
+        // The original button owns landscape fullscreen. In portrait it must
+        // remain an expand action, while the portrait button becomes the exit.
+        // Media3 echoes this state through its click listener synchronously;
+        // the listener consumes the target state without toggling it again.
+        val isLandscapeFullscreen = mode == FullscreenMode.LANDSCAPE
+        playerView?.setFullscreenButtonState(isLandscapeFullscreen)
+        playerView?.findViewById<ImageButton>(R.id.portrait_adaptation)?.apply {
+            visibility = if (fullscreenOrientation.canUsePortraitButton) View.VISIBLE else View.GONE
+            val label = getString(if (isPortraitFullscreen) R.string.exit_fullscreen else R.string.portrait_adaptation)
+            setImageResource(
+                if (isPortraitFullscreen) androidx.media3.ui.R.drawable.exo_icon_fullscreen_exit
+                else R.drawable.ic_portrait_playback
+            )
+            contentDescription = label
+            tooltipText = label
+        }
+        playerView?.findViewById<ImageButton>(androidx.media3.ui.R.id.exo_fullscreen)?.apply {
+            setImageResource(
+                if (isLandscapeFullscreen) androidx.media3.ui.R.drawable.exo_icon_fullscreen_exit
+                else R.drawable.ic_landscape_playback
+            )
+            val label = getString(if (isLandscapeFullscreen) R.string.exit_fullscreen else R.string.landscape_fullscreen)
+            contentDescription = label
+            tooltipText = label
+        }
+        playerView?.post { playerTimeLayout?.refresh() }
     }
 
     private fun normalPlayerHeight(): Int =
@@ -2017,6 +2234,7 @@ class MainActivity : Activity() {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         episodesPopup?.dismiss()
+        playerView?.let { ViewCompat.requestApplyInsets(it) }
         if (!isFullscreen) {
             playerView?.apply {
                 layoutParams.height = normalPlayerHeight()
@@ -2027,10 +2245,20 @@ class MainActivity : Activity() {
 
     private fun setFullscreen(fullscreen: Boolean) {
         if (isFullscreen == fullscreen) return
-        isFullscreen = fullscreen
+        val previousMode = fullscreenOrientation.mode
+        fullscreenOrientation.setFullscreen(fullscreen)
+        applyFullscreenPresentation(previousMode)
+    }
+
+    private fun applyFullscreenPresentation(previousMode: FullscreenMode) {
+        if (previousMode == fullscreenOrientation.mode) return
+        val fullscreen = isFullscreen
+        if ((previousMode != FullscreenMode.INLINE) == fullscreen) {
+            applyFullscreenOrientation(previousMode)
+            return
+        }
         val root = rootLayout ?: return
         val video = playerView ?: return
-        video.setFullscreenButtonState(fullscreen)
         volumePopup?.dismiss()
         episodesPopup?.dismiss()
         episodesButton?.visibility = if (fullscreen) View.VISIBLE else View.GONE
@@ -2045,7 +2273,6 @@ class MainActivity : Activity() {
                 0,
                 1f
             )
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             WindowCompat.setDecorFitsSystemWindows(window, false)
             WindowInsetsControllerCompat(window, window.decorView).apply {
                 hide(WindowInsetsCompat.Type.systemBars())
@@ -2061,10 +2288,10 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 normalPlayerHeight()
             )
-            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             WindowInsetsControllerCompat(window, window.decorView)
                 .show(WindowInsetsCompat.Type.systemBars())
         }
+        applyFullscreenOrientation(previousMode)
         ViewCompat.requestApplyInsets(root)
         video.requestLayout()
     }
@@ -2153,7 +2380,9 @@ class MainActivity : Activity() {
         if (speaker.parent === controls) return
 
         (speaker.parent as? ViewGroup)?.removeView(speaker)
-        val index = controls.indexOfChild(fullscreenButton)
+        val index = controls.indexOfChild(
+            playerView?.findViewById<View>(R.id.portrait_adaptation) ?: fullscreenButton
+        )
         if (index < 0) return
         controls.addView(
             speaker,
@@ -2208,7 +2437,9 @@ class MainActivity : Activity() {
             entries,
             player.currentMediaItem?.localConfiguration?.uri?.toString(),
             createPreview = { createMediaPreview(it, maxLines = 2, compact = true) },
+            portrait = isPortraitFullscreen,
             onPlay = { index ->
+                mediaSelectionSequence++
                 val uri = entries[index].uri
                 playbackCoordinator.playEntry((0 until player.mediaItemCount).firstOrNull {
                     player.getMediaItemAt(it).localConfiguration?.uri == uri

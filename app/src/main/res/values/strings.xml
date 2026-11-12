@@ -1,5 +1,8 @@
 <resources>
     <string name="app_name">夜莺播放器</string>
+    <string name="portrait_adaptation">竖屏全屏</string>
+    <string name="landscape_fullscreen">横屏全屏</string>
+    <string name="exit_fullscreen">退出全屏</string>
     <string name="thumbnail_loading">加载中</string>
     <string name="thumbnail_failed">预览失败</string>
     <string name="thumbnail_description">%1$s，视频封面</string>

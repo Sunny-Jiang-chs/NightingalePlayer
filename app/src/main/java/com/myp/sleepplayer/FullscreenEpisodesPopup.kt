@@ -33,6 +33,7 @@ internal class FullscreenEpisodesPopup(
     private val entries: List<MediaEntry>,
     currentUri: String?,
     private val createPreview: (MediaEntry) -> View,
+    private val portrait: Boolean = false,
     private val onPlay: (Int) -> Unit
 ) {
     private var playingUri = currentUri
@@ -96,7 +97,7 @@ internal class FullscreenEpisodesPopup(
         fun fitPanel() {
             val availableWidth = overlay.width - overlay.paddingLeft - overlay.paddingRight
             if (availableWidth <= 0) return
-            val width = minOf(dp(360), (availableWidth * 0.55f).roundToInt())
+            val width = minOf(dp(360), (availableWidth * if (portrait) 0.85f else 0.55f).roundToInt())
             if (panel.layoutParams.width != width) {
                 panel.layoutParams = panel.layoutParams.apply { this.width = width }
             }

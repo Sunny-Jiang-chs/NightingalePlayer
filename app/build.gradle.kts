@@ -11,8 +11,8 @@ android {
         applicationId = "com.myp.sleepplayer"
         minSdk = 26
         targetSdk = 36
-        versionCode = 27
-        versionName = "0.5.3"
+        versionCode = 28
+        versionName = "0.5.4"
     }
 
     buildTypes {
@@ -99,4 +99,22 @@ tasks.register<JavaExec>("verifyThumbnailPrefetch") {
         layout.buildDirectory.dir("tmp/kotlin-classes/debug")
     ) + configurations.getByName("debugUnitTestRuntimeClasspath")
     mainClass.set("com.myp.sleepplayer.ThumbnailPrefetchWindowTest")
+}
+
+tasks.register<JavaExec>("verifyVideoDisplayGeometry") {
+    dependsOn("compileDebugUnitTestKotlin")
+    classpath = files(
+        layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
+        layout.buildDirectory.dir("tmp/kotlin-classes/debug")
+    ) + configurations.getByName("debugUnitTestRuntimeClasspath")
+    mainClass.set("com.myp.sleepplayer.playback.VideoDisplayGeometryTest")
+}
+
+tasks.register<JavaExec>("verifyFullscreenOrientation") {
+    dependsOn("compileDebugUnitTestKotlin")
+    classpath = files(
+        layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest"),
+        layout.buildDirectory.dir("tmp/kotlin-classes/debug")
+    ) + configurations.getByName("debugUnitTestRuntimeClasspath")
+    mainClass.set("com.myp.sleepplayer.playback.FullscreenOrientationStateTest")
 }
